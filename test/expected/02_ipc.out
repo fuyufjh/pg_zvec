@@ -1,0 +1,39 @@
+-- 02_ipc.sql
+-- Verify: IPC roundtrip for management functions.
+-- In stub mode (no USE_ZVEC), the worker receives the request and returns
+-- a predictable bridge error.  Parameter validation errors fire in the
+-- backend before any IPC is attempted.
+-- ----------------------------------------------------------------
+-- zvec_create_collection – parameter validation (no IPC)
+-- ----------------------------------------------------------------
+-- dimension = 0 is rejected by the backend
+SELECT zvec_create_collection('t', 'tbl', 'vec', 0);
+ERROR:  dimension must be a positive integer
+-- negative dimension is also rejected
+SELECT zvec_create_collection('t', 'tbl', 'vec', -1);
+ERROR:  dimension must be a positive integer
+-- ----------------------------------------------------------------
+-- zvec_create_collection – IPC roundtrip (stub error)
+-- The backend packs the payload, the worker unpacks it and calls
+-- zvec_collection_create() which returns NULL in stub mode.
+-- ----------------------------------------------------------------
+SELECT zvec_create_collection(
+    'stub_coll', 'tbl', 'embedding', 4,
+    'cosine', 'hnsw', '{}', '/tmp/zvec_stub_coll');
+ERROR:  zvec_create_collection failed: zvec_collection_create: zvec library not compiled in (rebuild with -DUSE_ZVEC=ON)
+-- ----------------------------------------------------------------
+-- zvec_drop_collection – IPC roundtrip
+-- Worker receives the request; collection is not in its local map.
+-- ----------------------------------------------------------------
+SELECT zvec_drop_collection('nonexistent');
+ERROR:  zvec_drop_collection failed: collection "nonexistent" not found
+-- ----------------------------------------------------------------
+-- zvec_optimize – IPC roundtrip
+-- ----------------------------------------------------------------
+SELECT zvec_optimize('nonexistent');
+ERROR:  zvec_optimize failed: collection "nonexistent" not found
+-- ----------------------------------------------------------------
+-- zvec_stats – backend-direct (no IPC), collection not in registry
+-- ----------------------------------------------------------------
+SELECT * FROM zvec_stats('nonexistent');
+ERROR:  zvec collection "nonexistent" not found

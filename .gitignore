@@ -8,5 +8,7 @@ pg_zvec.index.bc
 
 # zvec is managed separately (as a submodule or separate build)
 
-# Test cluster data (not part of the extension source)
-/tmp/
+# pg_regress output (test/results/ and diffs are generated, not committed)
+test/results/
+test/regression.diffs
+test/regression.out

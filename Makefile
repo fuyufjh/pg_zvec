@@ -52,6 +52,11 @@ SHLIB_LINK += \
 	-lgflags -lglog -lpthread -lsnappy -lbz2 -lz -ldl
 endif
 
+# ---- Regression tests -------------------------------------------------------
+# Run with: PGHOST=/tmp/pg_zvec_socket PGPORT=5499 make installcheck
+REGRESS      = 01_extension 02_ipc 03_trigger 04_search
+REGRESS_OPTS = --inputdir=test --outputdir=test
+
 # ---- PGXS -------------------------------------------------------------------
 PG_CONFIG ?= pg_config
 PGXS      := $(shell $(PG_CONFIG) --pgxs)

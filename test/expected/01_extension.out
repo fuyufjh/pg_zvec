@@ -1,0 +1,51 @@
+-- 01_extension.sql
+-- Verify: extension loads, all functions register, background worker starts.
+CREATE EXTENSION pg_zvec;
+-- Extension visible in catalog
+SELECT extname, extversion
+FROM pg_extension
+WHERE extname = 'pg_zvec';
+ extname | extversion 
+---------+------------
+ pg_zvec | 1.0
+(1 row)
+
+-- All 9 SQL objects are registered
+SELECT proname
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public' AND proname LIKE 'zvec_%'
+ORDER BY proname;
+        proname         
+------------------------
+ zvec_attach_table
+ zvec_create_collection
+ zvec_drop_collection
+ zvec_optimize
+ zvec_search
+ zvec_search_filtered
+ zvec_stats
+ zvec_sync_trigger
+ zvec_worker_status
+(9 rows)
+
+-- Worker is ready and collection count starts at 0
+SELECT key, value
+FROM zvec_worker_status()
+WHERE key IN ('worker_ready', 'num_collections')
+ORDER BY key;
+       key       | value 
+-----------------+-------
+ num_collections | 0
+ worker_ready    | true
+(2 rows)
+
+-- Worker PID is a live positive integer (exact value varies)
+SELECT key, value::integer > 0 AS is_positive
+FROM zvec_worker_status()
+WHERE key = 'worker_pid';
+    key     | is_positive 
+------------+-------------
+ worker_pid | t
+(1 row)
+

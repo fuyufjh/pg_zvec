@@ -1,0 +1,34 @@
+-- 04_search.sql
+-- Verify: zvec_search input validation and error handling.
+-- Backend-direct path: collection lookup happens before calling the bridge.
+-- ----------------------------------------------------------------
+-- Non-existent collection
+-- ----------------------------------------------------------------
+SELECT * FROM zvec_search('no_coll', ARRAY[0.1, 0.2]::float4[], 5);
+ERROR:  zvec collection "no_coll" not found
+-- ----------------------------------------------------------------
+-- Filtered search on non-existent collection
+-- ----------------------------------------------------------------
+SELECT * FROM zvec_search_filtered(
+    'no_coll', ARRAY[0.1, 0.2]::float4[], 3, 'tag = ''x''');
+ERROR:  zvec collection "no_coll" not found
+-- ----------------------------------------------------------------
+-- 2-D query array: error fires before collection lookup
+-- ----------------------------------------------------------------
+SELECT * FROM zvec_search('no_coll', ARRAY[[0.1, 0.2]]::float4[], 5);
+ERROR:  query must be a 1-D float4 array
+-- ----------------------------------------------------------------
+-- Query array with NULL element: also caught before collection lookup
+-- ----------------------------------------------------------------
+SELECT * FROM zvec_search('no_coll', ARRAY[0.1, NULL]::float4[], 5);
+ERROR:  query vector must not contain NULLs
+-- ----------------------------------------------------------------
+-- zvec_sync_trigger called outside a trigger context
+-- ----------------------------------------------------------------
+SELECT zvec_sync_trigger();
+ERROR:  zvec_sync_trigger: not called as trigger
+-- ----------------------------------------------------------------
+-- zvec_stats on non-existent collection
+-- ----------------------------------------------------------------
+SELECT * FROM zvec_stats('no_coll');
+ERROR:  zvec collection "no_coll" not found
