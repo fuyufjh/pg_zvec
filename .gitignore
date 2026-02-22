@@ -1,0 +1,13 @@
+# Compiled extension
+*.so
+*.o
+*.bc
+
+# Build artifacts
+pg_zvec.index.bc
+
+# zvec is managed separately (as a submodule or separate build)
+zvec/
+
+# Test cluster data (not part of the extension source)
+/tmp/

@@ -1,0 +1,4 @@
+comment = 'High-performance vector search extension powered by zvec'
+default_version = '1.0'
+module_pathname = 'pg_zvec'
+relocatable = false
