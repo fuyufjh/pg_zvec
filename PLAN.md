@@ -93,7 +93,7 @@ DELETE FROM my_vectors WHERE id = 'doc1';
 
 ## 实施路线
 
-### Phase 1 — FDW 框架 + DDL 集成
+### Phase 1 — FDW 框架 + DDL 集成 ✅ **已完成（2026-02-23）**
 
 **目标**：注册 FDW，`CREATE FOREIGN TABLE` 能创建 zvec Collection，`DROP FOREIGN TABLE` 能销毁它。
 
@@ -101,12 +101,12 @@ DELETE FROM my_vectors WHERE id = 'doc1';
 
 丢弃旧的函数式 API，重构为 FDW 框架：
 
-- [ ] `pg_zvec_fdw.c` — 核心 FDW handler，注册 `FdwRoutine`
-- [ ] `pg_zvec_fdw.h` — FDW 内部共享结构定义
-- [ ] `pg_zvec_worker.c` — Background Worker（保留，负责写路径 + Collection 生命周期）
-- [ ] `pg_zvec_shmem.c/h` — 共享内存 + IPC（保留，结构不变）
-- [ ] `zvec_bridge.cc/h` — C++ bridge（保留，`#ifdef USE_ZVEC` 守卫）
-- [ ] `pg_zvec--2.0.sql` — 注册 FDW handler、FDW、距离算符、算符类
+- [x] `pg_zvec_fdw.c` — 核心 FDW handler，注册 `FdwRoutine`
+- [x] `pg_zvec_fdw.h` — FDW 内部共享结构定义
+- [x] `pg_zvec_worker.c` — Background Worker（保留，负责写路径 + Collection 生命周期）
+- [x] `pg_zvec_shmem.c/h` — 共享内存 + IPC（保留，结构不变）
+- [x] `zvec_bridge.cc/h` — C++ bridge（保留，`#ifdef USE_ZVEC` 守卫）
+- [x] `pg_zvec--2.0.sql` — 注册 FDW handler、FDW
 
 **SQL 扩展注册：**
 ```sql
@@ -119,11 +119,11 @@ CREATE FOREIGN DATA WRAPPER zvec_fdw
 
 #### 1.2 FDW Handler 骨架
 
-实现 `FdwRoutine` 的全部回调（大多数先返回 ereport/空实现）：
+实现 `FdwRoutine` 的全部回调（Phase 1 为 stub 实现，SELECT 返回 0 行）：
 
-**DDL 钩子（通过 ProcessUtility_hook 或 object_access_hook）：**
-- `CREATE FOREIGN TABLE` → 解析 OPTIONS，发送 `ZVEC_REQ_CREATE` 给 worker
-- `DROP FOREIGN TABLE` → 发送 `ZVEC_REQ_DROP` 给 worker
+**DDL 钩子（通过 `ProcessUtility_hook`，见技术注记 T3）：**
+- `CREATE FOREIGN TABLE` → 解析 OPTIONS，发送 `ZVEC_REQ_CREATE` 给 worker（IPC 失败降级为 WARNING，PG 目录条目仍创建）
+- `DROP FOREIGN TABLE` → 发送 `ZVEC_REQ_DROP` 给 worker（在 `standard_ProcessUtility` 之前收集 OID，之后发送）
 
 **OPTIONS 验证（`zvec_fdw_validator`）：**
 ```
@@ -133,10 +133,20 @@ CREATE FOREIGN DATA WRAPPER zvec_fdw
       m、ef_construction、nlist（索引参数）
 ```
 
-#### 1.3 Background Worker（复用 Phase 1 实现）
+#### 1.3 Background Worker（复用旧实现）
 
-- [ ] 复用已有 worker IPC 框架（`ZVEC_REQ_CREATE/DROP/INSERT/DELETE/OPTIMIZE`）
-- [ ] Worker 在启动时从 `pg_foreign_table` 系统表读取所有外部表，恢复 Collection 句柄
+- [x] 复用已有 worker IPC 框架（`ZVEC_REQ_CREATE/DROP/INSERT/DELETE/OPTIMIZE`）
+- [x] Worker 在启动时从 `pg_foreign_table` 系统表读取所有外部表，恢复 Collection 句柄
+
+#### 1.4 回归测试套件
+
+- [x] `test/sql/01_extension.sql` — 扩展注册、FDW 存在性、handler/validator 函数、版本验证
+- [x] `test/sql/02_server.sql` — CREATE SERVER（有效/无选项/非法选项）
+- [x] `test/sql/03_table_options.sql` — 验证器拒绝：缺少 dimension、零/负 dimension、非法 metric/index_type、未知选项
+- [x] `test/sql/04_ddl.sql` — CREATE/DROP FOREIGN TABLE（所有选项组合，验证 pg_class + pg_foreign_table 条目）
+- [x] `test/sql/05_scan.sql` — SELECT COUNT(\*)=0、列投影、EXPLAIN 显示 Foreign Scan 节点、WHERE 本地过滤
+
+所有测试通过：`make installcheck PGHOST=/tmp/pg_zvec_socket PGPORT=5499`
 
 ---
 
@@ -293,20 +303,29 @@ pg_zvec.log_level = 'warn'
 ```
 pg_zvec/
 ├── PLAN.md
-├── zvec/                        # git submodule
+├── zvec/                        # git submodule（zvec 源码）
 ├── src/
-│   ├── pg_zvec_fdw.c            # FDwRoutine 全部回调（主文件）
-│   ├── pg_zvec_fdw.h            # FdwScanState、ZvecANNInfo 等内部结构
-│   ├── pg_zvec_pathkeys.c       # GetForeignPaths：ANN 路径识别逻辑
-│   ├── pg_zvec_deparse.c        # 条件表达式 → zvec filter string
-│   ├── pg_zvec_worker.c         # Background Worker（写路径 + 生命周期）
-│   ├── pg_zvec_shmem.c/h        # 共享内存 + IPC 协议
-│   └── zvec_bridge.cc/h         # C++ → C bridge（USE_ZVEC 守卫）
+│   ├── pg_zvec_fdw.c            # FdwRoutine 全部回调 + ProcessUtility_hook（主文件）
+│   ├── pg_zvec_fdw.h            # ZvecFdwScanState、GUC 声明等内部结构
+│   ├── pg_zvec_worker.c         # Background Worker（写路径 + Collection 生命周期）
+│   ├── pg_zvec_shmem.c/h        # 共享内存 + IPC 协议（pack/unpack 工具函数）
+│   └── zvec_bridge/
+│       ├── zvec_bridge.cc       # C++ → C bridge（USE_ZVEC 守卫）
+│       └── zvec_bridge.h
 ├── sql/
-│   ├── pg_zvec--2.0.sql         # FDW + 算符 + 算符类 SQL 定义
-│   └── pg_zvec--1.x--2.0.sql   # 升级脚本（如需）
+│   └── pg_zvec--2.0.sql         # FDW handler/validator + CREATE FOREIGN DATA WRAPPER
+├── test/
+│   ├── sql/                     # pg_regress 输入（01~05）
+│   └── expected/                # pg_regress 期望输出
 ├── pg_zvec.control
-└── Makefile                     # PGXS
+└── Makefile                     # PGXS + C++ 显式编译规则
+```
+
+**Phase 2 计划新增（尚未创建）：**
+```
+src/
+├── pg_zvec_pathkeys.c       # GetForeignPaths：ANN 路径识别逻辑
+└── pg_zvec_deparse.c        # 条件表达式 → zvec filter string
 ```
 
 ---
@@ -329,13 +348,22 @@ query vector 可能是参数（Prepared Statement）或常量：
 - 常量：在 `GetForeignPlan` 时直接序列化进 `fdw_private`
 - 参数（Param）：在 `BeginForeignScan` 时通过 `ExecEvalExpr` 求值
 
-### T3：zvec Collection 生命周期与 `CREATE FOREIGN TABLE` 的绑定
+### T3：zvec Collection 生命周期与 `CREATE FOREIGN TABLE` 的绑定 ✅ **已解决**
 
-`CREATE FOREIGN TABLE` 是标准 DDL，PG 不提供 FDW 回调。需要使用：
-- `object_access_hook`：`OAT_POST_CREATE` 对 `ForeignTableRelationId` 触发创建
-- `object_access_hook`：`OAT_DROP` 触发销毁
+`CREATE FOREIGN TABLE` 是标准 DDL，PG 不提供 FDW 回调。
 
-或者：在 `BeginForeignScan` / `BeginForeignModify` 时懒惰创建 Collection（首次访问时创建）。
+**已验证不可行的方案：`object_access_hook` + `OAT_POST_CREATE`**
+- `OAT_POST_CREATE` 在 `heap_create_with_catalog()` 内部触发，此时 `InsertForeignTableTuple()` 尚未执行
+- 因此 `pg_foreign_table` 中还没有该表的行，无法确认它是 zvec 外部表
+- 即使通过 relkind 判断是 `RELKIND_FOREIGN_TABLE`，OPTIONS 也读不到
+
+**实际采用方案：`ProcessUtility_hook`**
+```c
+// DROP：在 standard_ProcessUtility 之前收集 OID（因为之后 pg_class 行已删除）
+// CREATE：在 standard_ProcessUtility 之后读取 OPTIONS（此时 pg_foreign_table 已填充）
+```
+- DROP 失败时报 WARNING（不影响 PG catalog 清理）
+- CREATE 失败时报 WARNING（PG catalog 条目保留，下次访问时懒惰重试）
 
 ### T4：多进程只读句柄安全性
 
@@ -369,12 +397,13 @@ zvec 的只读句柄是否线程/进程安全需验证（见 zvec `collection.h`
 
 ## 验收标准
 
-### Phase 1
+### Phase 1 ✅ 已达成
 ```sql
 CREATE EXTENSION pg_zvec;
 CREATE SERVER zvec_server FOREIGN DATA WRAPPER zvec_fdw OPTIONS (data_dir '/tmp/zvec_data');
 CREATE FOREIGN TABLE vecs (id text, emb float4[]) SERVER zvec_server OPTIONS (dimension '4', metric 'cosine');
--- zvec Collection 被创建
+-- zvec Collection 被创建（stub 模式下 WARNING，USE_ZVEC=1 时实际创建）
+SELECT COUNT(*) FROM vecs;  -- 返回 0 行，无错误
 DROP FOREIGN TABLE vecs;
 -- zvec Collection 被销毁
 ```
@@ -404,3 +433,4 @@ DELETE FROM vecs WHERE id = 'a';
 |------|------|
 | 2026-02-22 | 初始函数式 API 方案（Phase 1 完成） |
 | 2026-02-23 | 架构重新设计：放弃函数式 API，改为 FDW + ANN 下推方案 |
+| 2026-02-23 | Phase 1 FDW 实现完成：FDW handler/validator、ProcessUtility_hook DDL 拦截、stub 扫描回调、5 个回归测试全部通过（commit b38c58b） |
