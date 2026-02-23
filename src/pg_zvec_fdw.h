@@ -7,6 +7,7 @@
 #define PG_ZVEC_FDW_H
 
 #include "postgres.h"
+#include "access/attnum.h"
 #include "fmgr.h"
 
 /* ----------------------------------------------------------------
@@ -36,5 +37,20 @@ typedef struct ZvecFdwScanState
     /* filled in BeginForeignScan, used by IterateForeignScan */
     bool    done;
 } ZvecFdwScanState;
+
+/* ----------------------------------------------------------------
+ * Per-modify execution state (INSERT / DELETE)
+ *
+ * Convention: attno 1 (the first column) is the primary key (text).
+ * The vector column is the first float4[] column found in the tuple.
+ * ---------------------------------------------------------------- */
+typedef struct ZvecFdwModifyState
+{
+    char        collection_name[128];   /* zvec collection name (= relation name) */
+    int         pk_attno;               /* 1-based attno of pk column */
+    int         vec_attno;              /* 1-based attno of float4[] column */
+    int         dimension;              /* expected vector length */
+    AttrNumber  pk_junk_attno;          /* junk attno in planSlot (DELETE only) */
+} ZvecFdwModifyState;
 
 #endif /* PG_ZVEC_FDW_H */

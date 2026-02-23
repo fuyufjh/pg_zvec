@@ -5,8 +5,6 @@
 -- Minimal: only required option
 CREATE FOREIGN TABLE vecs_minimal (id text, emb float4[])
     SERVER zvec_server OPTIONS (dimension '4');
-WARNING:  pg_zvec: failed to create collection "vecs_minimal": zvec_collection_create: zvec library not compiled in (rebuild with -DUSE_ZVEC=ON)
-HINT:  The foreign table metadata was recorded; the zvec collection will be retried on next access.
 -- Verify it landed in pg_class and pg_foreign_table
 SELECT relname, relkind FROM pg_class WHERE relname = 'vecs_minimal';
    relname    | relkind 
@@ -30,8 +28,6 @@ CREATE FOREIGN TABLE vecs_full (id text, emb float4[])
         m               '16',
         ef_construction '200'
     );
-WARNING:  pg_zvec: failed to create collection "vecs_full": zvec_collection_create: zvec library not compiled in (rebuild with -DUSE_ZVEC=ON)
-HINT:  The foreign table metadata was recorded; the zvec collection will be retried on next access.
 SELECT relname FROM pg_class WHERE relname = 'vecs_full';
   relname  
 -----------
@@ -46,8 +42,6 @@ CREATE FOREIGN TABLE vecs_ivf (id text, emb float4[])
         index_type 'ivf',
         nlist      '256'
     );
-WARNING:  pg_zvec: failed to create collection "vecs_ivf": zvec_collection_create: zvec library not compiled in (rebuild with -DUSE_ZVEC=ON)
-HINT:  The foreign table metadata was recorded; the zvec collection will be retried on next access.
 SELECT relname FROM pg_class WHERE relname = 'vecs_ivf';
  relname  
 ----------
@@ -57,8 +51,6 @@ SELECT relname FROM pg_class WHERE relname = 'vecs_ivf';
 -- FLAT collection
 CREATE FOREIGN TABLE vecs_flat (id text, emb float4[])
     SERVER zvec_server OPTIONS (dimension '8', metric 'cosine', index_type 'flat');
-WARNING:  pg_zvec: failed to create collection "vecs_flat": zvec_collection_create: zvec library not compiled in (rebuild with -DUSE_ZVEC=ON)
-HINT:  The foreign table metadata was recorded; the zvec collection will be retried on next access.
 SELECT relname FROM pg_class WHERE relname = 'vecs_flat';
   relname  
 -----------
@@ -67,7 +59,6 @@ SELECT relname FROM pg_class WHERE relname = 'vecs_flat';
 
 -- DROP removes from pg_class
 DROP FOREIGN TABLE vecs_minimal;
-WARNING:  pg_zvec: failed to drop collection "vecs_minimal": collection "vecs_minimal" not found
 SELECT COUNT(*) AS gone FROM pg_class WHERE relname = 'vecs_minimal';
  gone 
 ------
@@ -76,6 +67,4 @@ SELECT COUNT(*) AS gone FROM pg_class WHERE relname = 'vecs_minimal';
 
 -- Keep vecs_full for scan test; clean up the others
 DROP FOREIGN TABLE vecs_ivf;
-WARNING:  pg_zvec: failed to drop collection "vecs_ivf": collection "vecs_ivf" not found
 DROP FOREIGN TABLE vecs_flat;
-WARNING:  pg_zvec: failed to drop collection "vecs_flat": collection "vecs_flat" not found

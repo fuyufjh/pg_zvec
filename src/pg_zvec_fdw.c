@@ -19,15 +19,19 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#include "optimizer/appendinfo.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
@@ -39,6 +43,7 @@
 #include "storage/procarray.h"
 #include "storage/shmem.h"
 #include "tcop/utility.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -61,6 +66,9 @@ int   pg_zvec_max_buffer_mb    = 64;
  * ---------------------------------------------------------------- */
 static shmem_startup_hook_type      prev_shmem_startup_hook    = NULL;
 static ProcessUtility_hook_type     prev_process_utility_hook  = NULL;
+#if PG_VERSION_NUM >= 150000
+static shmem_request_hook_type      prev_shmem_request_hook    = NULL;
+#endif
 
 /* ----------------------------------------------------------------
  * Helpers: options parsing
@@ -521,6 +529,269 @@ zvec_end_foreign_scan(ForeignScanState *node)
 }
 
 /* ----------------------------------------------------------------
+ * FdwRoutine callbacks — Phase 3: INSERT / DELETE
+ * ---------------------------------------------------------------- */
+
+/*
+ * zvec_add_foreign_update_targets
+ *
+ * Register the PK column (attno 1) as a junk "zvec_pk" attribute so the
+ * executor can pass it to ExecForeignDelete.
+ */
+static void
+zvec_add_foreign_update_targets(PlannerInfo *root,
+                                 Index rtindex,
+                                 RangeTblEntry *target_rte,
+                                 Relation target_relation)
+{
+    Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(target_relation), 0);
+    Var *var = makeVar(rtindex,
+                       1,               /* attno of pk column (1-based) */
+                       attr->atttypid,
+                       attr->atttypmod,
+                       attr->attcollation,
+                       0);              /* varlevelsup */
+    add_row_identity_var(root, var, rtindex, "zvec_pk");
+}
+
+/*
+ * zvec_plan_foreign_modify — no planner-side work needed.
+ */
+static List *
+zvec_plan_foreign_modify(PlannerInfo *root,
+                          ModifyTable *plan,
+                          Index resultRelation,
+                          int subplan_index)
+{
+    return NIL;
+}
+
+/*
+ * zvec_begin_foreign_modify
+ *
+ * Set up ZvecFdwModifyState: locate pk and vector columns, look up the
+ * junk attribute number for DELETE.
+ */
+static void
+zvec_begin_foreign_modify(ModifyTableState *mtstate,
+                           ResultRelInfo *rinfo,
+                           List *fdw_private,
+                           int subplan_index,
+                           int eflags)
+{
+    ZvecFdwModifyState *mstate;
+    Relation            rel = rinfo->ri_RelationDesc;
+    TupleDesc           tupdesc = RelationGetDescr(rel);
+    ForeignTable       *ft;
+    ForeignServer      *server;
+    char               *data_dir, *metric, *index_type, *params_json;
+    int                 dimension;
+    int                 i;
+
+    if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+        return;
+
+    mstate = palloc0(sizeof(ZvecFdwModifyState));
+
+    /* Collection name = relation name (schema-unqualified) */
+    strlcpy(mstate->collection_name, RelationGetRelationName(rel),
+            sizeof(mstate->collection_name));
+
+    /* Get dimension from FDW options */
+    ft     = GetForeignTable(RelationGetRelid(rel));
+    server = GetForeignServer(ft->serverid);
+    zvec_table_options(ft, server, &data_dir, &dimension,
+                       &metric, &index_type, &params_json);
+    mstate->dimension = dimension;
+
+    /* PK column: attno 1 by convention */
+    mstate->pk_attno = 1;
+
+    /* Vector column: first float4[] attribute */
+    mstate->vec_attno = -1;
+    for (i = 0; i < tupdesc->natts; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+        if (!attr->attisdropped && attr->atttypid == FLOAT4ARRAYOID)
+        {
+            mstate->vec_attno = i + 1;  /* 1-based */
+            break;
+        }
+    }
+    if (mstate->vec_attno < 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+                 errmsg("pg_zvec: no float4[] vector column found in \"%s\"",
+                        mstate->collection_name)));
+
+    /* For DELETE: locate the "zvec_pk" junk attribute in the subplan */
+    if (mtstate->operation == CMD_DELETE)
+    {
+        Plan *subplan = outerPlanState(mtstate)->plan;
+        mstate->pk_junk_attno =
+            ExecFindJunkAttributeInTlist(subplan->targetlist, "zvec_pk");
+        if (!AttributeNumberIsValid(mstate->pk_junk_attno))
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("pg_zvec: could not find junk attribute \"zvec_pk\"")));
+    }
+
+    rinfo->ri_FdwState = mstate;
+}
+
+/*
+ * zvec_exec_foreign_insert
+ *
+ * Extract pk (attno 1) and vector (first float4[]) from the slot and send a
+ * ZVEC_REQ_INSERT to the background worker.
+ */
+static TupleTableSlot *
+zvec_exec_foreign_insert(EState *estate,
+                          ResultRelInfo *rinfo,
+                          TupleTableSlot *slot,
+                          TupleTableSlot *planSlot)
+{
+    ZvecFdwModifyState *mstate = (ZvecFdwModifyState *) rinfo->ri_FdwState;
+    ZvecRequest         req;
+    ZvecResponse        resp;
+    char                errbuf[256];
+    int                 pos = 0;
+    bool                isnull;
+    Datum               pk_datum;
+    Datum               vec_datum;
+    char               *pk_str;
+    ArrayType          *arr;
+    float4             *vec;
+    int                 vec_len;
+
+    /* Extract PK (text) */
+    slot_getallattrs(slot);
+    pk_datum = slot_getattr(slot, mstate->pk_attno, &isnull);
+    if (isnull)
+        ereport(ERROR,
+                (errcode(ERRCODE_NOT_NULL_VIOLATION),
+                 errmsg("pg_zvec: pk column (attno %d) must not be NULL",
+                        mstate->pk_attno)));
+    pk_str = TextDatumGetCString(pk_datum);
+    if (strlen(pk_str) >= 256)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("pg_zvec: pk value exceeds maximum length of 255 bytes")));
+
+    /* Extract vector (float4[]) */
+    vec_datum = slot_getattr(slot, mstate->vec_attno, &isnull);
+    if (isnull)
+        ereport(ERROR,
+                (errcode(ERRCODE_NOT_NULL_VIOLATION),
+                 errmsg("pg_zvec: vector column must not be NULL")));
+    arr = DatumGetArrayTypeP(vec_datum);
+    if (ARR_NDIM(arr) != 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                 errmsg("pg_zvec: vector must be a 1-dimensional float4 array")));
+    vec_len = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+    if (vec_len != mstate->dimension)
+        ereport(ERROR,
+                (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                 errmsg("pg_zvec: expected vector dimension %d, got %d",
+                        mstate->dimension, vec_len)));
+    vec = (float4 *) ARR_DATA_PTR(arr);
+
+    /* Build IPC payload: [name\0][pk\0][vec_len:int32][float32*vec_len] */
+    memset(&req, 0, sizeof(req));
+    req.type        = ZVEC_REQ_INSERT;
+    req.database_id = MyDatabaseId;
+
+    pos = zvec_pack_str(req.data, pos, sizeof(req.data), mstate->collection_name);
+    if (pos < 0) goto overflow;
+    pos = zvec_pack_str(req.data, pos, sizeof(req.data), pk_str);
+    if (pos < 0) goto overflow;
+    pos = zvec_pack_int(req.data, pos, sizeof(req.data), vec_len);
+    if (pos < 0) goto overflow;
+    pos = zvec_pack_floats(req.data, pos, sizeof(req.data), vec, vec_len);
+    if (pos < 0) goto overflow;
+    req.data_len = pos;
+
+    if (!send_worker_request(&req, &resp, 10000, errbuf, sizeof(errbuf)))
+        ereport(ERROR,
+                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                 errmsg("pg_zvec: INSERT failed: %s", errbuf)));
+
+    return slot;
+
+overflow:
+    ereport(ERROR,
+            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+             errmsg("pg_zvec: IPC buffer overflow building INSERT request")));
+    return NULL; /* unreachable */
+}
+
+/*
+ * zvec_exec_foreign_delete
+ *
+ * Extract the pk from the "zvec_pk" junk attribute in planSlot and send a
+ * ZVEC_REQ_DELETE to the background worker.
+ */
+static TupleTableSlot *
+zvec_exec_foreign_delete(EState *estate,
+                          ResultRelInfo *rinfo,
+                          TupleTableSlot *slot,
+                          TupleTableSlot *planSlot)
+{
+    ZvecFdwModifyState *mstate = (ZvecFdwModifyState *) rinfo->ri_FdwState;
+    ZvecRequest         req;
+    ZvecResponse        resp;
+    char                errbuf[256];
+    int                 pos = 0;
+    bool                isnull;
+    Datum               pk_datum;
+    char               *pk_str;
+
+    /* Get PK from junk attribute in planSlot */
+    pk_datum = ExecGetJunkAttribute(planSlot, mstate->pk_junk_attno, &isnull);
+    if (isnull)
+        ereport(ERROR,
+                (errcode(ERRCODE_NOT_NULL_VIOLATION),
+                 errmsg("pg_zvec: junk pk attribute is NULL")));
+    pk_str = TextDatumGetCString(pk_datum);
+
+    /* Build IPC payload: [name\0][pk\0] */
+    memset(&req, 0, sizeof(req));
+    req.type        = ZVEC_REQ_DELETE;
+    req.database_id = MyDatabaseId;
+
+    pos = zvec_pack_str(req.data, pos, sizeof(req.data), mstate->collection_name);
+    if (pos < 0) goto overflow;
+    pos = zvec_pack_str(req.data, pos, sizeof(req.data), pk_str);
+    if (pos < 0) goto overflow;
+    req.data_len = pos;
+
+    if (!send_worker_request(&req, &resp, 10000, errbuf, sizeof(errbuf)))
+        ereport(ERROR,
+                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                 errmsg("pg_zvec: DELETE failed: %s", errbuf)));
+
+    return slot;
+
+overflow:
+    ereport(ERROR,
+            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+             errmsg("pg_zvec: IPC buffer overflow building DELETE request")));
+    return NULL; /* unreachable */
+}
+
+/*
+ * zvec_end_foreign_modify — release per-statement state.
+ */
+static void
+zvec_end_foreign_modify(EState *estate, ResultRelInfo *rinfo)
+{
+    ZvecFdwModifyState *mstate = (ZvecFdwModifyState *) rinfo->ri_FdwState;
+    if (mstate)
+        pfree(mstate);
+}
+
+/* ----------------------------------------------------------------
  * FDW handler
  * ---------------------------------------------------------------- */
 PG_FUNCTION_INFO_V1(zvec_fdw_handler);
@@ -538,13 +809,13 @@ zvec_fdw_handler(PG_FUNCTION_ARGS)
     routine->ReScanForeignScan  = zvec_rescan_foreign_scan;
     routine->EndForeignScan     = zvec_end_foreign_scan;
 
-    /* Modify (Phase 3) — leave NULL for now */
-    routine->AddForeignUpdateTargets = NULL;
-    routine->PlanForeignModify       = NULL;
-    routine->BeginForeignModify      = NULL;
-    routine->ExecForeignInsert       = NULL;
-    routine->ExecForeignDelete       = NULL;
-    routine->EndForeignModify        = NULL;
+    /* Modify (Phase 3) */
+    routine->AddForeignUpdateTargets = zvec_add_foreign_update_targets;
+    routine->PlanForeignModify       = zvec_plan_foreign_modify;
+    routine->BeginForeignModify      = zvec_begin_foreign_modify;
+    routine->ExecForeignInsert       = zvec_exec_foreign_insert;
+    routine->ExecForeignDelete       = zvec_exec_foreign_delete;
+    routine->EndForeignModify        = zvec_end_foreign_modify;
 
     PG_RETURN_POINTER(routine);
 }
@@ -623,6 +894,20 @@ zvec_fdw_validator(PG_FUNCTION_ARGS)
 
     PG_RETURN_VOID();
 }
+
+/* ----------------------------------------------------------------
+ * Shared memory request hook (PG15+)
+ * ---------------------------------------------------------------- */
+#if PG_VERSION_NUM >= 150000
+static void
+pg_zvec_shmem_request_hook(void)
+{
+    if (prev_shmem_request_hook)
+        prev_shmem_request_hook();
+    RequestAddinShmemSpace(pg_zvec_shmem_size());
+    RequestNamedLWLockTranche("pg_zvec", 1);
+}
+#endif
 
 /* ----------------------------------------------------------------
  * Shared memory startup
@@ -705,8 +990,13 @@ _PG_init(void)
         PGC_SIGHUP, 0, NULL, NULL, NULL);
 
     /* Shared memory */
+#if PG_VERSION_NUM >= 150000
+    prev_shmem_request_hook = shmem_request_hook;
+    shmem_request_hook      = pg_zvec_shmem_request_hook;
+#else
     RequestAddinShmemSpace(pg_zvec_shmem_size());
     RequestNamedLWLockTranche("pg_zvec", 1);
+#endif
     prev_shmem_startup_hook = shmem_startup_hook;
     shmem_startup_hook      = pg_zvec_shmem_startup_hook;
 

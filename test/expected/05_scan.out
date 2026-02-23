@@ -31,6 +31,5 @@ EXPLAIN (COSTS OFF) SELECT id FROM vecs_full WHERE id = 'x';
 
 -- Teardown (CASCADE to drop the server as well)
 DROP FOREIGN TABLE vecs_full;
-WARNING:  pg_zvec: failed to drop collection "vecs_full": collection "vecs_full" not found
 DROP SERVER zvec_server CASCADE;
 DROP EXTENSION pg_zvec CASCADE;

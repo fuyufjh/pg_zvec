@@ -64,6 +64,7 @@ zvec_collection_create(const char *data_dir,
 {
     auto metric_type = parse_metric(metric);
     auto idx_type    = parse_index_type(index_type);
+    (void)idx_type; /* TODO: use idx_type to select HNSW/IVF/FLAT */
 
     /* Build schema with a single vector field named "embedding" */
     zvec::CollectionSchema schema("default");
@@ -142,7 +143,7 @@ zvec_collection_destroy(ZvecCollectionHandle *h, char *errbuf, int errbuf_len)
         snprintf(errbuf, errbuf_len, "%s", st.message().c_str());
         return false;
     }
-    delete h;
+    /* Do NOT delete h here; caller must call zvec_collection_close() to free. */
     return true;
 }
 
@@ -239,8 +240,7 @@ zvec_collection_doc_count(ZvecCollectionHandle *h)
     auto result = h->col->Stats();
     if (!result)
         return -1;
-    /* Stats returns a struct; total_doc_count is the aggregate */
-    return static_cast<int>(result->total_doc_count_);
+    return static_cast<int>(result->doc_count);
 }
 
 } /* extern "C" */

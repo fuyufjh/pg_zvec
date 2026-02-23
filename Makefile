@@ -34,22 +34,36 @@ PG_CPPFLAGS = -I$(CURDIR)/src
 SHLIB_LINK += -lstdc++
 
 ifdef USE_ZVEC
-ZVEC_BUILD ?= $(CURDIR)/zvec/build
+ZVEC_BUILD  ?= $(CURDIR)/zvec/build
+ZVEC_EXT    := $(ZVEC_BUILD)/external/usr/local/lib
+ZVEC_LIB    := $(ZVEC_BUILD)/lib
+ZVEC_ARROW  := $(ZVEC_BUILD)/thirdparty/arrow/arrow/src/ARROW.BUILD-build
 SHLIB_LINK += \
-	$(ZVEC_BUILD)/lib/libzvec.a \
-	$(ZVEC_BUILD)/external/usr/local/lib/librocksdb.a \
-	$(ZVEC_BUILD)/external/usr/local/lib/libarrow.a \
-	$(ZVEC_BUILD)/external/usr/local/lib/libprotobuf.a \
-	$(ZVEC_BUILD)/external/usr/local/lib/libantlr4-runtime.a \
-	$(ZVEC_BUILD)/external/usr/local/lib/libroaring.a \
-	$(ZVEC_BUILD)/external/usr/local/lib/liblz4.a \
-	-lgflags -lglog -lpthread -lsnappy -lbz2 -lz -ldl
+	$(ZVEC_LIB)/libzvec_db.a \
+	$(ZVEC_LIB)/libzvec_core.a \
+	$(ZVEC_LIB)/libzvec_ailego.a \
+	$(ZVEC_LIB)/libzvec_proto.a \
+	$(ZVEC_EXT)/libparquet.a \
+	$(ZVEC_EXT)/libarrow_dataset.a \
+	$(ZVEC_EXT)/libarrow_acero.a \
+	$(ZVEC_EXT)/libarrow_compute.a \
+	$(ZVEC_EXT)/libarrow.a \
+	$(ZVEC_EXT)/libarrow_bundled_dependencies.a \
+	$(ZVEC_EXT)/librocksdb.a \
+	$(ZVEC_EXT)/libprotobuf.a \
+	$(ZVEC_EXT)/libantlr4-runtime.a \
+	$(ZVEC_EXT)/libroaring.a \
+	$(ZVEC_EXT)/liblz4.a \
+	$(ZVEC_EXT)/libglog.a \
+	$(ZVEC_EXT)/libgflags_nothreads.a \
+	$(ZVEC_ARROW)/zlib_ep/src/zlib_ep-install/lib/libz.a \
+	-lpthread -ldl
 endif
 
 # ---- Regression tests -------------------------------------------------------
 # Run with:
 #   PGHOST=/tmp/pg_zvec_socket PGPORT=5499 make installcheck
-REGRESS      = 01_extension 02_server 03_table_options 04_ddl 05_scan
+REGRESS      = 01_extension 02_server 03_table_options 04_ddl 05_scan 06_modify
 REGRESS_OPTS = \
 	--inputdir=test \
 	--outputdir=test \
@@ -84,7 +98,7 @@ $(CXX_OBJ): src/zvec_bridge/zvec_bridge.cc src/zvec_bridge/zvec_bridge.h
 	$(CXX) $(ZVEC_CXXFLAGS) -c $< -o $@
 
 # JIT bitcode for C++ bridge
-CLANGXX ?= clang++-14
+CLANGXX ?= clang++-17
 
 src/zvec_bridge/zvec_bridge.bc: src/zvec_bridge/zvec_bridge.cc src/zvec_bridge/zvec_bridge.h
 	$(CLANGXX) -std=c++17 -fPIC -O2 \
