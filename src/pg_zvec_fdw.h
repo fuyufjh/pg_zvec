@@ -51,6 +51,8 @@ typedef struct ZvecFdwModifyState
     int         vec_attno;              /* 1-based attno of float4[] column */
     int         dimension;              /* expected vector length */
     AttrNumber  pk_junk_attno;          /* junk attno in planSlot (DELETE only) */
+    Oid         pk_typoutput;           /* output function OID for pk type */
+    bool        pk_typisvarlena;        /* is pk type varlena? */
 } ZvecFdwModifyState;
 
 #endif /* PG_ZVEC_FDW_H */

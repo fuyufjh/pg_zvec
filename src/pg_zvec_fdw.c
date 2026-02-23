@@ -604,8 +604,12 @@ zvec_begin_foreign_modify(ModifyTableState *mtstate,
                        &metric, &index_type, &params_json);
     mstate->dimension = dimension;
 
-    /* PK column: attno 1 by convention */
+    /* PK column: attno 1 by convention; look up its output function so we
+     * can convert any type (int, bigint, uuid, text, …) to a cstring. */
     mstate->pk_attno = 1;
+    getTypeOutputInfo(TupleDescAttr(tupdesc, 0)->atttypid,
+                      &mstate->pk_typoutput,
+                      &mstate->pk_typisvarlena);
 
     /* Vector column: first float4[] attribute */
     mstate->vec_attno = -1;
@@ -672,7 +676,7 @@ zvec_exec_foreign_insert(EState *estate,
                 (errcode(ERRCODE_NOT_NULL_VIOLATION),
                  errmsg("pg_zvec: pk column (attno %d) must not be NULL",
                         mstate->pk_attno)));
-    pk_str = TextDatumGetCString(pk_datum);
+    pk_str = OidOutputFunctionCall(mstate->pk_typoutput, pk_datum);
     if (strlen(pk_str) >= 256)
         ereport(ERROR,
                 (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -753,7 +757,7 @@ zvec_exec_foreign_delete(EState *estate,
         ereport(ERROR,
                 (errcode(ERRCODE_NOT_NULL_VIOLATION),
                  errmsg("pg_zvec: junk pk attribute is NULL")));
-    pk_str = TextDatumGetCString(pk_datum);
+    pk_str = OidOutputFunctionCall(mstate->pk_typoutput, pk_datum);
 
     /* Build IPC payload: [name\0][pk\0] */
     memset(&req, 0, sizeof(req));
