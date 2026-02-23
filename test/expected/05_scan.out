@@ -1,0 +1,36 @@
+-- 05_scan.sql
+-- Test: foreign scan callbacks.
+-- vecs_full was created in 04_ddl.sql.
+-- Phase 1 stub: SELECT returns 0 rows without error
+SELECT COUNT(*) FROM vecs_full;
+ count 
+-------
+     0
+(1 row)
+
+-- Column projection works
+SELECT id, emb FROM vecs_full;
+ id | emb 
+----+-----
+(0 rows)
+
+-- EXPLAIN shows Foreign Scan node
+EXPLAIN (COSTS OFF) SELECT id FROM vecs_full;
+        QUERY PLAN         
+---------------------------
+ Foreign Scan on vecs_full
+(1 row)
+
+-- WHERE clause (local filter, no pushdown yet)
+EXPLAIN (COSTS OFF) SELECT id FROM vecs_full WHERE id = 'x';
+         QUERY PLAN         
+----------------------------
+ Foreign Scan on vecs_full
+   Filter: (id = 'x'::text)
+(2 rows)
+
+-- Teardown (CASCADE to drop the server as well)
+DROP FOREIGN TABLE vecs_full;
+WARNING:  pg_zvec: failed to drop collection "vecs_full": collection "vecs_full" not found
+DROP SERVER zvec_server CASCADE;
+DROP EXTENSION pg_zvec CASCADE;

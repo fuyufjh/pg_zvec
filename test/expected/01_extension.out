@@ -1,0 +1,28 @@
+-- 01_extension.sql
+-- Test: extension and FDW registration
+CREATE EXTENSION pg_zvec;
+-- FDW should appear in catalog
+SELECT fdwname FROM pg_foreign_data_wrapper WHERE fdwname = 'zvec_fdw';
+ fdwname  
+----------
+ zvec_fdw
+(1 row)
+
+-- Handler and validator functions should exist
+SELECT proname, prorettype::regtype
+FROM pg_proc
+WHERE proname IN ('zvec_fdw_handler', 'zvec_fdw_validator')
+ORDER BY proname;
+      proname       | prorettype  
+--------------------+-------------
+ zvec_fdw_handler   | fdw_handler
+ zvec_fdw_validator | void
+(2 rows)
+
+-- Extension should be listed at version 2.0
+SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_zvec';
+ extname | extversion 
+---------+------------
+ pg_zvec | 2.0
+(1 row)
+

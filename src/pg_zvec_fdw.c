@@ -1,0 +1,719 @@
+/*
+ * pg_zvec_fdw.c
+ *
+ * Foreign Data Wrapper for zvec vector collections.
+ *
+ * Phase 1 scope:
+ *   - Register FDW handler / validator
+ *   - CREATE FOREIGN TABLE  → create zvec Collection via worker IPC
+ *   - DROP   FOREIGN TABLE  → destroy zvec Collection via worker IPC
+ *   - Stub scan / modify callbacks (return errors; replaced in Phase 2-3)
+ */
+
+#include "pg_zvec_fdw.h"
+#include "pg_zvec_shmem.h"
+#include "zvec_bridge/zvec_bridge.h"
+
+#include "access/htup_details.h"
+#include "access/reloptions.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_foreign_server.h"
+#include "catalog/pg_foreign_table.h"
+#include "commands/defrem.h"
+#include "commands/explain.h"
+#include "executor/executor.h"
+#include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
+#include "miscadmin.h"
+#include "nodes/nodes.h"
+#include "nodes/parsenodes.h"
+#include "nodes/pg_list.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/planmain.h"
+#include "optimizer/restrictinfo.h"
+#include "postmaster/bgworker.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+#include "storage/lwlock.h"
+#include "storage/proc.h"
+#include "storage/procarray.h"
+#include "storage/shmem.h"
+#include "tcop/utility.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/wait_event.h"
+
+PG_MODULE_MAGIC;
+
+/* ----------------------------------------------------------------
+ * GUC parameters
+ * ---------------------------------------------------------------- */
+char *pg_zvec_data_dir      = NULL;
+int   pg_zvec_query_threads    = 4;
+int   pg_zvec_optimize_threads = 2;
+int   pg_zvec_max_buffer_mb    = 64;
+
+/* ----------------------------------------------------------------
+ * Hook chains
+ * ---------------------------------------------------------------- */
+static shmem_startup_hook_type      prev_shmem_startup_hook    = NULL;
+static ProcessUtility_hook_type     prev_process_utility_hook  = NULL;
+
+/* ----------------------------------------------------------------
+ * Helpers: options parsing
+ * ---------------------------------------------------------------- */
+
+/*
+ * zvec_table_options — extract zvec-specific OPTIONS from a ForeignTable.
+ *
+ * All output pointers are palloc'd strings or default values.
+ */
+static void
+zvec_table_options(ForeignTable *ft, ForeignServer *server,
+                   char **out_data_dir,
+                   int  *out_dimension,
+                   char **out_metric,
+                   char **out_index_type,
+                   char **out_params_json)
+{
+    ListCell *lc;
+    char     *data_dir    = NULL;
+    int       dimension   = 0;
+    char     *metric      = pstrdup("cosine");
+    char     *index_type  = pstrdup("hnsw");
+    /* Build params JSON from optional m / ef_construction / nlist */
+    int       m = 0, efc = 0, nlist = 0;
+
+    /* Server-level options */
+    foreach(lc, server->options)
+    {
+        DefElem *def = (DefElem *) lfirst(lc);
+        if (strcmp(def->defname, "data_dir") == 0)
+            data_dir = defGetString(def);
+    }
+
+    /* Table-level options override server-level */
+    foreach(lc, ft->options)
+    {
+        DefElem *def = (DefElem *) lfirst(lc);
+        if (strcmp(def->defname, "dimension") == 0)
+            dimension = atoi(defGetString(def));
+        else if (strcmp(def->defname, "metric") == 0)
+            metric = defGetString(def);
+        else if (strcmp(def->defname, "index_type") == 0)
+            index_type = defGetString(def);
+        else if (strcmp(def->defname, "m") == 0)
+            m = atoi(defGetString(def));
+        else if (strcmp(def->defname, "ef_construction") == 0)
+            efc = atoi(defGetString(def));
+        else if (strcmp(def->defname, "nlist") == 0)
+            nlist = atoi(defGetString(def));
+    }
+
+    /* Build params JSON */
+    {
+    StringInfoData buf;
+    bool first = true;
+    initStringInfo(&buf);
+    appendStringInfoChar(&buf, '{');
+    if (m > 0)
+    {
+        appendStringInfo(&buf, "\"m\":%d", m);
+        first = false;
+    }
+    if (efc > 0)
+    {
+        if (!first) appendStringInfoChar(&buf, ',');
+        appendStringInfo(&buf, "\"ef_construction\":%d", efc);
+        first = false;
+    }
+    if (nlist > 0)
+    {
+        if (!first) appendStringInfoChar(&buf, ',');
+        appendStringInfo(&buf, "\"nlist\":%d", nlist);
+    }
+    appendStringInfoChar(&buf, '}');
+    *out_params_json = buf.data;
+    }
+
+    /* Compute data_dir */
+    if (!data_dir || data_dir[0] == '\0')
+    {
+        if (pg_zvec_data_dir && pg_zvec_data_dir[0] != '\0')
+            data_dir = pg_zvec_data_dir;
+        else
+        {
+            StringInfoData d;
+            initStringInfo(&d);
+            appendStringInfo(&d, "%s/pg_zvec", DataDir);
+            data_dir = d.data;
+        }
+    }
+
+    *out_data_dir   = data_dir;
+    *out_dimension  = dimension;
+    *out_metric     = metric;
+    *out_index_type = index_type;
+}
+
+/* ----------------------------------------------------------------
+ * IPC: send a request to the background worker and wait for response
+ * ---------------------------------------------------------------- */
+static bool
+send_worker_request(ZvecRequest *req, ZvecResponse *resp,
+                    int timeout_ms, char *errbuf, int errbuf_len)
+{
+    int waited = 0;
+
+    if (!pg_zvec_state)
+    {
+        snprintf(errbuf, errbuf_len, "pg_zvec shared memory not initialised");
+        return false;
+    }
+
+    LWLockAcquire(pg_zvec_state->lock, LW_EXCLUSIVE);
+
+    if (!pg_zvec_state->worker_ready)
+    {
+        LWLockRelease(pg_zvec_state->lock);
+        snprintf(errbuf, errbuf_len, "pg_zvec worker is not running");
+        return false;
+    }
+
+    if (pg_zvec_state->request_pending)
+    {
+        LWLockRelease(pg_zvec_state->lock);
+        snprintf(errbuf, errbuf_len, "pg_zvec worker is busy; try again later");
+        return false;
+    }
+
+    req->sender_pid = MyProcPid;
+    memcpy(&pg_zvec_state->request, req, sizeof(ZvecRequest));
+    pg_zvec_state->request_pending = true;
+    pg_zvec_state->response_ready  = false;
+
+    if (pg_zvec_state->worker_pid > 0)
+    {
+        PGPROC *worker = BackendPidGetProc(pg_zvec_state->worker_pid);
+        if (worker)
+            SetLatch(&worker->procLatch);
+    }
+
+    LWLockRelease(pg_zvec_state->lock);
+
+    while (waited < timeout_ms)
+    {
+        int rc;
+
+        rc = WaitLatch(MyLatch,
+                       WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+                       100L,
+                       PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+
+        if (rc & WL_EXIT_ON_PM_DEATH)
+        {
+            snprintf(errbuf, errbuf_len, "postmaster died");
+            return false;
+        }
+
+        LWLockAcquire(pg_zvec_state->lock, LW_SHARED);
+        if (pg_zvec_state->response_ready)
+        {
+            memcpy(resp, &pg_zvec_state->response, sizeof(ZvecResponse));
+            LWLockRelease(pg_zvec_state->lock);
+            if (!resp->success)
+                snprintf(errbuf, errbuf_len, "%s", resp->error_msg);
+            return resp->success;
+        }
+        LWLockRelease(pg_zvec_state->lock);
+
+        waited += 100;
+    }
+
+    snprintf(errbuf, errbuf_len, "timed out waiting for pg_zvec worker");
+    return false;
+}
+
+/* ----------------------------------------------------------------
+ * DDL helpers: create / drop a collection for a foreign table
+ * ---------------------------------------------------------------- */
+
+static void
+zvec_create_collection_for_table(Oid relid)
+{
+    ForeignTable  *ft;
+    ForeignServer *server;
+    char          *data_dir;
+    int            dimension;
+    char          *metric;
+    char          *index_type;
+    char          *params_json;
+    char           col_path[ZVEC_MAX_PATH_LEN];
+    char           col_name[ZVEC_MAX_NAME_LEN];
+    char           errbuf[256];
+    ZvecRequest    req;
+    ZvecResponse   resp;
+    int            pos = 0;
+
+    ft     = GetForeignTable(relid);
+    server = GetForeignServer(ft->serverid);
+
+    zvec_table_options(ft, server,
+                       &data_dir, &dimension, &metric, &index_type, &params_json);
+
+    if (dimension <= 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_zvec: foreign table must specify a positive \"dimension\" option")));
+
+    /* Collection name = relation name (schema-unqualified) */
+    strlcpy(col_name, get_rel_name(relid), sizeof(col_name));
+
+    /* Full path = data_dir / col_name */
+    snprintf(col_path, sizeof(col_path), "%s/%s", data_dir, col_name);
+
+    memset(&req, 0, sizeof(req));
+    req.type        = ZVEC_REQ_CREATE_COLLECTION;
+    req.database_id = MyDatabaseId;
+
+    pos = zvec_pack_str(req.data, pos, sizeof(req.data), col_name);
+    if (pos < 0) goto overflow;
+    pos = zvec_pack_str(req.data, pos, sizeof(req.data), col_path);
+    if (pos < 0) goto overflow;
+    pos = zvec_pack_str(req.data, pos, sizeof(req.data), index_type);
+    if (pos < 0) goto overflow;
+    pos = zvec_pack_str(req.data, pos, sizeof(req.data), metric);
+    if (pos < 0) goto overflow;
+    pos = zvec_pack_int(req.data, pos, sizeof(req.data), dimension);
+    if (pos < 0) goto overflow;
+    pos = zvec_pack_str(req.data, pos, sizeof(req.data), params_json);
+    if (pos < 0) goto overflow;
+    req.data_len = pos;
+
+    if (!send_worker_request(&req, &resp, 10000, errbuf, sizeof(errbuf)))
+        ereport(WARNING,
+                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                 errmsg("pg_zvec: failed to create collection \"%s\": %s",
+                        col_name, errbuf),
+                 errhint("The foreign table metadata was recorded; "
+                         "the zvec collection will be retried on next access.")));
+    return;
+
+overflow:
+    ereport(WARNING,
+            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+             errmsg("pg_zvec: IPC buffer overflow building CREATE request")));
+}
+
+static void
+zvec_drop_collection_for_table(Oid relid)
+{
+    char          col_name[ZVEC_MAX_NAME_LEN];
+    char          errbuf[256];
+    ZvecRequest   req;
+    ZvecResponse  resp;
+    int           pos = 0;
+    char         *rel_name;
+
+    rel_name = get_rel_name(relid);
+    if (!rel_name)
+        return; /* already gone */
+
+    strlcpy(col_name, rel_name, sizeof(col_name));
+
+    memset(&req, 0, sizeof(req));
+    req.type        = ZVEC_REQ_DROP_COLLECTION;
+    req.database_id = MyDatabaseId;
+
+    pos = zvec_pack_str(req.data, pos, sizeof(req.data), col_name);
+    if (pos < 0)
+    {
+        ereport(WARNING,
+                (errmsg("pg_zvec: IPC buffer overflow building DROP request")));
+        return;
+    }
+    req.data_len = pos;
+
+    if (!send_worker_request(&req, &resp, 10000, errbuf, sizeof(errbuf)))
+        ereport(WARNING,
+                (errmsg("pg_zvec: failed to drop collection \"%s\": %s",
+                        col_name, errbuf)));
+}
+
+/* ----------------------------------------------------------------
+ * ProcessUtility_hook: intercept CREATE / DROP FOREIGN TABLE
+ *
+ * CREATE: run after standard_ProcessUtility so the pg_foreign_table
+ *         row exists and we can look up options.
+ * DROP:   run before standard_ProcessUtility so the catalog is intact
+ *         and we can look up collection names.
+ * ---------------------------------------------------------------- */
+
+/*
+ * is_zvec_foreign_table — return true if relid belongs to a foreign table
+ * that uses zvec_fdw.  Returns false (not error) if the relation is not a
+ * foreign table or uses a different FDW.
+ */
+static bool
+is_zvec_foreign_table(Oid relid)
+{
+    ForeignTable       *ft;
+    ForeignServer      *server;
+    ForeignDataWrapper *fdw;
+
+    if (get_rel_relkind(relid) != RELKIND_FOREIGN_TABLE)
+        return false;
+
+    ft     = GetForeignTable(relid);
+    server = GetForeignServer(ft->serverid);
+    fdw    = GetForeignDataWrapper(server->fdwid);
+
+    return (strcmp(fdw->fdwname, "zvec_fdw") == 0);
+}
+
+static void
+pg_zvec_process_utility(PlannedStmt *pstmt,
+                         const char *queryString,
+                         bool readOnlyTree,
+                         ProcessUtilityContext context,
+                         ParamListInfo params,
+                         QueryEnvironment *queryEnv,
+                         DestReceiver *dest,
+                         QueryCompletion *qc)
+{
+    Node *parsetree = pstmt->utilityStmt;
+
+    /* ----------------------------------------------------------------
+     * DROP FOREIGN TABLE: collect collection names BEFORE the drop so
+     * the catalog is still intact.
+     * ---------------------------------------------------------------- */
+    if (IsA(parsetree, DropStmt))
+    {
+        DropStmt *drop = (DropStmt *) parsetree;
+
+        if (drop->removeType == OBJECT_FOREIGN_TABLE)
+        {
+            ListCell *lc;
+            /* Collect OIDs now; catalog will be gone after standard_ProcessUtility */
+            List *drop_oids = NIL;
+
+            foreach(lc, drop->objects)
+            {
+                RangeVar *rv  = makeRangeVarFromNameList((List *) lfirst(lc));
+                Oid       oid = RangeVarGetRelid(rv, AccessShareLock, true);
+
+                if (OidIsValid(oid) && is_zvec_foreign_table(oid))
+                    drop_oids = lappend_oid(drop_oids, oid);
+            }
+
+            /* Fire IPC for each collection BEFORE the catalog entry disappears */
+            {
+                ListCell *lc2;
+                foreach(lc2, drop_oids)
+                    zvec_drop_collection_for_table(lfirst_oid(lc2));
+            }
+        }
+    }
+
+    /* ----------------------------------------------------------------
+     * Run standard (or chained) ProcessUtility
+     * ---------------------------------------------------------------- */
+    if (prev_process_utility_hook)
+        prev_process_utility_hook(pstmt, queryString, readOnlyTree,
+                                   context, params, queryEnv, dest, qc);
+    else
+        standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+                                 context, params, queryEnv, dest, qc);
+
+    /* ----------------------------------------------------------------
+     * CREATE FOREIGN TABLE: create the collection AFTER the table
+     * (and its pg_foreign_table row) has been fully inserted.
+     * ---------------------------------------------------------------- */
+    if (IsA(parsetree, CreateForeignTableStmt))
+    {
+        CreateForeignTableStmt *cfts = (CreateForeignTableStmt *) parsetree;
+        RangeVar *rv  = cfts->base.relation;
+        Oid       oid = RangeVarGetRelid(rv, NoLock, true);
+
+        if (OidIsValid(oid) && is_zvec_foreign_table(oid))
+            zvec_create_collection_for_table(oid);
+    }
+}
+
+/* ----------------------------------------------------------------
+ * FdwRoutine callbacks — Phase 1 stubs
+ * ---------------------------------------------------------------- */
+
+static void
+zvec_get_foreign_rel_size(PlannerInfo *root,
+                           RelOptInfo  *baserel,
+                           Oid          foreigntableid)
+{
+    baserel->rows = 1000;
+}
+
+static void
+zvec_get_foreign_paths(PlannerInfo *root,
+                        RelOptInfo  *baserel,
+                        Oid          foreigntableid)
+{
+    add_path(baserel,
+             (Path *) create_foreignscan_path(root, baserel,
+                                               NULL,            /* default pathtarget */
+                                               baserel->rows,
+                                               1,               /* startup cost */
+                                               baserel->rows * 1,
+                                               NIL,             /* no pathkeys */
+                                               baserel->lateral_relids,
+                                               NULL,
+                                               NIL));
+}
+
+static ForeignScan *
+zvec_get_foreign_plan(PlannerInfo      *root,
+                       RelOptInfo       *baserel,
+                       Oid               foreigntableid,
+                       ForeignPath      *best_path,
+                       List             *tlist,
+                       List             *scan_clauses,
+                       Plan             *outer_plan)
+{
+    scan_clauses = extract_actual_clauses(scan_clauses, false);
+    return make_foreignscan(tlist,
+                             scan_clauses,
+                             baserel->relid,
+                             NIL,  /* no remote exprs */
+                             best_path->fdw_private,
+                             NIL,  /* no custom tlist */
+                             NIL,  /* no remote conds */
+                             outer_plan);
+}
+
+static void
+zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
+{
+    ZvecFdwScanState *state = palloc0(sizeof(ZvecFdwScanState));
+    state->done = true; /* Phase 1: always empty */
+    node->fdw_state = state;
+}
+
+static TupleTableSlot *
+zvec_iterate_foreign_scan(ForeignScanState *node)
+{
+    /* Return empty slot — no rows in Phase 1 */
+    return ExecClearTuple(node->ss.ss_ScanTupleSlot);
+}
+
+static void
+zvec_rescan_foreign_scan(ForeignScanState *node)
+{
+    /* no-op */
+}
+
+static void
+zvec_end_foreign_scan(ForeignScanState *node)
+{
+    /* no-op */
+}
+
+/* ----------------------------------------------------------------
+ * FDW handler
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(zvec_fdw_handler);
+Datum
+zvec_fdw_handler(PG_FUNCTION_ARGS)
+{
+    FdwRoutine *routine = makeNode(FdwRoutine);
+
+    /* Scan */
+    routine->GetForeignRelSize  = zvec_get_foreign_rel_size;
+    routine->GetForeignPaths    = zvec_get_foreign_paths;
+    routine->GetForeignPlan     = zvec_get_foreign_plan;
+    routine->BeginForeignScan   = zvec_begin_foreign_scan;
+    routine->IterateForeignScan = zvec_iterate_foreign_scan;
+    routine->ReScanForeignScan  = zvec_rescan_foreign_scan;
+    routine->EndForeignScan     = zvec_end_foreign_scan;
+
+    /* Modify (Phase 3) — leave NULL for now */
+    routine->AddForeignUpdateTargets = NULL;
+    routine->PlanForeignModify       = NULL;
+    routine->BeginForeignModify      = NULL;
+    routine->ExecForeignInsert       = NULL;
+    routine->ExecForeignDelete       = NULL;
+    routine->EndForeignModify        = NULL;
+
+    PG_RETURN_POINTER(routine);
+}
+
+/* ----------------------------------------------------------------
+ * OPTIONS validator
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(zvec_fdw_validator);
+Datum
+zvec_fdw_validator(PG_FUNCTION_ARGS)
+{
+    List     *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
+    Oid       catalog       = PG_GETARG_OID(1);
+    ListCell *lc;
+    bool      has_dimension = false;
+
+    foreach(lc, options_list)
+    {
+        DefElem *def = (DefElem *) lfirst(lc);
+
+        if (catalog == ForeignTableRelationId)
+        {
+            if (strcmp(def->defname, "dimension") == 0)
+            {
+                int dim = atoi(defGetString(def));
+                if (dim <= 0)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                             errmsg("pg_zvec: \"dimension\" must be a positive integer")));
+                has_dimension = true;
+            }
+            else if (strcmp(def->defname, "metric") == 0)
+            {
+                const char *v = defGetString(def);
+                if (strcmp(v, "l2")     != 0 &&
+                    strcmp(v, "ip")     != 0 &&
+                    strcmp(v, "cosine") != 0)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                             errmsg("pg_zvec: \"metric\" must be l2, ip, or cosine")));
+            }
+            else if (strcmp(def->defname, "index_type") == 0)
+            {
+                const char *v = defGetString(def);
+                if (strcmp(v, "hnsw") != 0 &&
+                    strcmp(v, "ivf")  != 0 &&
+                    strcmp(v, "flat") != 0)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                             errmsg("pg_zvec: \"index_type\" must be hnsw, ivf, or flat")));
+            }
+            else if (strcmp(def->defname, "m")              != 0 &&
+                     strcmp(def->defname, "ef_construction") != 0 &&
+                     strcmp(def->defname, "nlist")           != 0)
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("pg_zvec: unrecognised foreign table option \"%s\"",
+                                def->defname)));
+            }
+        }
+        else if (catalog == ForeignServerRelationId)
+        {
+            if (strcmp(def->defname, "data_dir") != 0)
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("pg_zvec: unrecognised server option \"%s\"",
+                                def->defname)));
+        }
+    }
+
+    if (catalog == ForeignTableRelationId && !has_dimension)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_zvec: foreign table must specify \"dimension\" option")));
+
+    PG_RETURN_VOID();
+}
+
+/* ----------------------------------------------------------------
+ * Shared memory startup
+ * ---------------------------------------------------------------- */
+static void
+pg_zvec_shmem_startup_hook(void)
+{
+    if (prev_shmem_startup_hook)
+        prev_shmem_startup_hook();
+    pg_zvec_shmem_startup();
+}
+
+/* ----------------------------------------------------------------
+ * Background worker registration
+ * ---------------------------------------------------------------- */
+static void
+register_background_worker(void)
+{
+    BackgroundWorker worker;
+
+    MemSet(&worker, 0, sizeof(worker));
+    worker.bgw_flags        = BGWORKER_SHMEM_ACCESS;
+    worker.bgw_start_time   = BgWorkerStart_ConsistentState;
+    worker.bgw_restart_time = 5;
+
+    snprintf(worker.bgw_library_name,  BGW_MAXLEN, "pg_zvec");
+    snprintf(worker.bgw_function_name, BGW_MAXLEN, "pg_zvec_worker_main");
+    snprintf(worker.bgw_name,          BGW_MAXLEN, "pg_zvec worker");
+    snprintf(worker.bgw_type,          BGW_MAXLEN, "pg_zvec");
+
+    worker.bgw_notify_pid = 0;
+    RegisterBackgroundWorker(&worker);
+}
+
+/* ----------------------------------------------------------------
+ * _PG_init
+ * ---------------------------------------------------------------- */
+void _PG_init(void);
+
+void
+_PG_init(void)
+{
+    if (!process_shared_preload_libraries_in_progress)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_zvec must be loaded via shared_preload_libraries")));
+
+    /* GUCs */
+    DefineCustomStringVariable(
+        "pg_zvec.data_dir",
+        "Directory where zvec collections are stored.",
+        "Empty string defaults to $PGDATA/pg_zvec.",
+        &pg_zvec_data_dir,
+        "",
+        PGC_POSTMASTER,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "pg_zvec.query_threads",
+        "Number of threads used for vector search queries.",
+        NULL,
+        &pg_zvec_query_threads,
+        4, 1, 64,
+        PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "pg_zvec.optimize_threads",
+        "Number of threads used for index optimization.",
+        NULL,
+        &pg_zvec_optimize_threads,
+        2, 1, 32,
+        PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "pg_zvec.max_buffer_mb",
+        "Maximum write-buffer size per collection in MiB.",
+        NULL,
+        &pg_zvec_max_buffer_mb,
+        64, 8, 8192,
+        PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    /* Shared memory */
+    RequestAddinShmemSpace(pg_zvec_shmem_size());
+    RequestNamedLWLockTranche("pg_zvec", 1);
+    prev_shmem_startup_hook = shmem_startup_hook;
+    shmem_startup_hook      = pg_zvec_shmem_startup_hook;
+
+    /* Background worker */
+    register_background_worker();
+
+    /* DDL hook */
+    prev_process_utility_hook = ProcessUtility_hook;
+    ProcessUtility_hook       = pg_zvec_process_utility;
+}

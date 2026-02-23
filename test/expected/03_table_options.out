@@ -1,0 +1,27 @@
+-- 03_table_options.sql
+-- Test: foreign table option validation
+-- All errors below are from the validator and never reach IPC.
+-- Missing dimension: must be rejected
+CREATE FOREIGN TABLE no_dim (id text, emb float4[])
+    SERVER zvec_server OPTIONS (metric 'cosine');
+ERROR:  pg_zvec: foreign table must specify "dimension" option
+-- dimension = 0 is invalid
+CREATE FOREIGN TABLE bad_dim_zero (id text, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '0');
+ERROR:  pg_zvec: "dimension" must be a positive integer
+-- Negative dimension is invalid
+CREATE FOREIGN TABLE bad_dim_neg (id text, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '-1');
+ERROR:  pg_zvec: "dimension" must be a positive integer
+-- Invalid metric
+CREATE FOREIGN TABLE bad_metric (id text, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '4', metric 'euclidean');
+ERROR:  pg_zvec: "metric" must be l2, ip, or cosine
+-- Invalid index_type
+CREATE FOREIGN TABLE bad_idx (id text, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '4', index_type 'lsh');
+ERROR:  pg_zvec: "index_type" must be hnsw, ivf, or flat
+-- Unrecognised table option
+CREATE FOREIGN TABLE bad_opt (id text, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '4', unknown_param 'x');
+ERROR:  pg_zvec: unrecognised foreign table option "unknown_param"

@@ -1,0 +1,81 @@
+-- 04_ddl.sql
+-- Test: CREATE / DROP FOREIGN TABLE DDL with valid options.
+-- Without USE_ZVEC the worker emits a WARNING for the IPC stub but the
+-- PG catalog entry is created successfully.
+-- Minimal: only required option
+CREATE FOREIGN TABLE vecs_minimal (id text, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '4');
+WARNING:  pg_zvec: failed to create collection "vecs_minimal": zvec_collection_create: zvec library not compiled in (rebuild with -DUSE_ZVEC=ON)
+HINT:  The foreign table metadata was recorded; the zvec collection will be retried on next access.
+-- Verify it landed in pg_class and pg_foreign_table
+SELECT relname, relkind FROM pg_class WHERE relname = 'vecs_minimal';
+   relname    | relkind 
+--------------+---------
+ vecs_minimal | f
+(1 row)
+
+SELECT COUNT(*) AS in_pg_foreign_table
+    FROM pg_foreign_table WHERE ftrelid = 'vecs_minimal'::regclass;
+ in_pg_foreign_table 
+---------------------
+                   1
+(1 row)
+
+-- All valid options (cosine/hnsw with m and ef_construction)
+CREATE FOREIGN TABLE vecs_full (id text, emb float4[])
+    SERVER zvec_server OPTIONS (
+        dimension       '128',
+        metric          'cosine',
+        index_type      'hnsw',
+        m               '16',
+        ef_construction '200'
+    );
+WARNING:  pg_zvec: failed to create collection "vecs_full": zvec_collection_create: zvec library not compiled in (rebuild with -DUSE_ZVEC=ON)
+HINT:  The foreign table metadata was recorded; the zvec collection will be retried on next access.
+SELECT relname FROM pg_class WHERE relname = 'vecs_full';
+  relname  
+-----------
+ vecs_full
+(1 row)
+
+-- IVF collection
+CREATE FOREIGN TABLE vecs_ivf (id text, emb float4[])
+    SERVER zvec_server OPTIONS (
+        dimension  '64',
+        metric     'ip',
+        index_type 'ivf',
+        nlist      '256'
+    );
+WARNING:  pg_zvec: failed to create collection "vecs_ivf": zvec_collection_create: zvec library not compiled in (rebuild with -DUSE_ZVEC=ON)
+HINT:  The foreign table metadata was recorded; the zvec collection will be retried on next access.
+SELECT relname FROM pg_class WHERE relname = 'vecs_ivf';
+ relname  
+----------
+ vecs_ivf
+(1 row)
+
+-- FLAT collection
+CREATE FOREIGN TABLE vecs_flat (id text, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '8', metric 'cosine', index_type 'flat');
+WARNING:  pg_zvec: failed to create collection "vecs_flat": zvec_collection_create: zvec library not compiled in (rebuild with -DUSE_ZVEC=ON)
+HINT:  The foreign table metadata was recorded; the zvec collection will be retried on next access.
+SELECT relname FROM pg_class WHERE relname = 'vecs_flat';
+  relname  
+-----------
+ vecs_flat
+(1 row)
+
+-- DROP removes from pg_class
+DROP FOREIGN TABLE vecs_minimal;
+WARNING:  pg_zvec: failed to drop collection "vecs_minimal": collection "vecs_minimal" not found
+SELECT COUNT(*) AS gone FROM pg_class WHERE relname = 'vecs_minimal';
+ gone 
+------
+    0
+(1 row)
+
+-- Keep vecs_full for scan test; clean up the others
+DROP FOREIGN TABLE vecs_ivf;
+WARNING:  pg_zvec: failed to drop collection "vecs_ivf": collection "vecs_ivf" not found
+DROP FOREIGN TABLE vecs_flat;
+WARNING:  pg_zvec: failed to drop collection "vecs_flat": collection "vecs_flat" not found
