@@ -2,180 +2,399 @@
 
 ## 项目目标
 
-将阿里巴巴开源的 zvec 向量数据库实现为 PostgreSQL 扩展（pg_zvec），提供比 pgvector 更高性能的 ANN 检索能力。
+将阿里巴巴开源的 zvec 向量数据库实现为 PostgreSQL FDW 扩展（pg_zvec），提供比 pgvector 更高性能的 ANN 检索能力，并以 `ORDER BY embedding <-> query LIMIT k` 的原生 SQL 语法暴露搜索能力。
+
+---
 
 ## 总体架构
 
 ```
-PostgreSQL Backend Process(es)
-  │  SQL 函数调用 / 触发器
-  │  共享内存队列 (DSM + LWLock)
+用户 SQL
+  │
+  │  SELECT * FROM my_vectors
+  │  ORDER BY embedding <-> '[0.1, 0.2, ...]'
+  │  LIMIT 10;
+  │
   ▼
-pg_zvec Background Worker
-  │  持有 zvec Collection 单例
-  │  处理读写请求
+PostgreSQL 查询规划器
+  │  GetForeignPaths() 识别 ORDER BY <-> LIMIT 模式
+  │  生成 ForeignScan 路径，fdw_private 携带 {query_vec, k, filter}
   ▼
-zvec Collection (外部文件, $PGDATA/pg_zvec/<name>/)
-  ├── Segment 0/          # 向量 + 标量数据
-  ├── Segment 1/
-  ├── id_map/             # RocksDB (PK → doc_id)
-  └── meta/               # Collection 元数据 + PG LSN 水位线
+FDW Scan 执行器（backend 进程内）
+  │  BeginForeignScan → 打开 zvec Collection 只读句柄
+  │  IterateForeignScan → 调用 zvec KNN search，逐行返回
+  │  EndForeignScan → 释放句柄
+  ▼
+zvec Collection（文件系统，$PGDATA/pg_zvec/<name>/）
+
+INSERT INTO my_vectors VALUES (...);
+  │
+  ▼
+FDW Modify 执行器
+  │  ExecForeignInsert → worker IPC（单写者）
+  ▼
+pg_zvec Background Worker（持有 Collection 写句柄）
 ```
+
+**核心设计决策：**
+- **读（ANN搜索/顺序扫描）**：backend 直接持有只读句柄，无需 worker，无并发瓶颈
+- **写（INSERT/DELETE）**：通过 background worker IPC 串行化，保证 zvec WAL 一致性
+- **DDL（CREATE/DROP FOREIGN TABLE）**：通过 worker IPC 创建/销毁 Collection
+- **ANN 下推**：`GetForeignPaths` 识别 `ORDER BY <op>(col, $param) LIMIT k` 模式
+
+---
+
+## DDL 用法（目标）
+
+```sql
+-- 安装扩展（注册 FDW handler）
+CREATE EXTENSION pg_zvec;
+
+-- FDW 已由扩展自动创建（无需手动 CREATE FOREIGN DATA WRAPPER）
+
+-- 创建服务器（全局配置）
+CREATE SERVER zvec_server FOREIGN DATA WRAPPER zvec_fdw
+  OPTIONS (data_dir '/var/lib/pg_zvec');
+
+-- 创建外部表 = 创建一个 zvec Collection
+CREATE FOREIGN TABLE my_vectors (
+    id      text,
+    content text,
+    embedding float4[]
+)
+SERVER zvec_server
+OPTIONS (
+    dimension    '1536',
+    metric       'cosine',    -- cosine | l2 | ip
+    index_type   'hnsw',      -- hnsw | ivf | flat
+    m            '16',
+    ef_construction '200'
+);
+
+-- 自然的 ANN 搜索
+SELECT id, content, embedding <=> '[0.1, 0.2, ...]'::float4[] AS score
+FROM my_vectors
+ORDER BY embedding <=> '[0.1, 0.2, ...]'::float4[]
+LIMIT 10;
+
+-- 带标量过滤（pushdown 到 zvec filter engine）
+SELECT id, content
+FROM my_vectors
+WHERE content LIKE '%postgres%'
+ORDER BY embedding <=> '[...]'::float4[]
+LIMIT 10;
+
+-- 写入
+INSERT INTO my_vectors VALUES ('doc1', 'hello world', '{0.1, 0.2, ...}');
+DELETE FROM my_vectors WHERE id = 'doc1';
+```
+
+---
 
 ## 实施路线
 
-### Phase 1 — MVP：函数式 API + Background Worker
+### Phase 1 — FDW 框架 + DDL 集成
 
-**目标**：可用的最小实现，不涉及 Index AM。
+**目标**：注册 FDW，`CREATE FOREIGN TABLE` 能创建 zvec Collection，`DROP FOREIGN TABLE` 能销毁它。
 
-#### 1.1 项目脚手架 ✅
-- [x] 创建扩展目录结构（`pg_zvec.c/h`, `pg_zvec.control`, `Makefile`, SQL 文件）
-- [x] C++ bridge 通过 `#ifdef USE_ZVEC` 守卫，无 zvec 库也能编译
-- [x] PGXS JIT bitcode 步骤：用 `clang++-14` 正确生成 `zvec_bridge.bc`
-- [x] 验证：`CREATE EXTENSION pg_zvec` 成功，`zvec_worker_status()` 返回正确数据
+#### 1.1 项目脚手架重构
 
-**关键构建笔记：**
-- `module_pathname = 'pg_zvec'`（不要用 `$libdir/pg_zvec`），让 `dynamic_library_path` 生效
-- `PG_WAIT_EXTENSION`（PG 14）而非 `WAIT_EVENT_EXTENSION`
-- `BackendPidGetProc` 在 `storage/procarray.h`
-- `MyProcPid/MyLatch/MyDatabaseId` 在 `miscadmin.h`
-- JIT bitcode 规则：用 `clang++-14 -flto=thin -emit-llvm` 编译 `.cc → .bc`
-- 本地测试集群：`initdb + unix_socket_directories=/tmp/pg_zvec_socket + extension_destdir`
+丢弃旧的函数式 API，重构为 FDW 框架：
 
-#### 1.2 Background Worker ✅
-- [x] `pg_zvec_worker.c`：实现 worker 全生命周期（启动/主循环/优雅关闭）
-- [x] IPC 协议：单槽位 `ZvecRequest/ZvecResponse` 共享内存 + `LWLock` + `SetLatch/WaitLatch`
-- [x] Worker 本地 Collection 注册表：`WorkerCollection worker_colls[64]`（进程私有）
-- [x] 共享内存 Collection 注册表：`PgZvecSharedState.collections[]`（供所有 backend 读取 data_dir）
-- [x] `process_request()` 实现所有 case：PING / CREATE / DROP / INSERT / DELETE / OPTIMIZE
+- [ ] `pg_zvec_fdw.c` — 核心 FDW handler，注册 `FdwRoutine`
+- [ ] `pg_zvec_fdw.h` — FDW 内部共享结构定义
+- [ ] `pg_zvec_worker.c` — Background Worker（保留，负责写路径 + Collection 生命周期）
+- [ ] `pg_zvec_shmem.c/h` — 共享内存 + IPC（保留，结构不变）
+- [ ] `zvec_bridge.cc/h` — C++ bridge（保留，`#ifdef USE_ZVEC` 守卫）
+- [ ] `pg_zvec--2.0.sql` — 注册 FDW handler、FDW、距离算符、算符类
 
-#### 1.3 管理函数 ✅
-- [x] `zvec_create_collection(name, table_name, vector_col, dimension, metric, index_type, params, data_dir)` — 打包 IPC payload 发送给 worker
-- [x] `zvec_drop_collection(name)` — IPC DROP
-- [x] `zvec_optimize(name)` — IPC OPTIMIZE（30 秒超时）
-- [x] `zvec_stats(name)` — backend 直接打开只读 handle，返回 doc_count
-
-**API 变更说明（相对 PLAN.md 初版）：**
-- `zvec_create_collection` 增加了显式的 `dimension integer` 和 `metric text` 参数，去掉了从 params JSON 隐式解析的逻辑
-- 最终签名：`(collection_name, table_name, vector_column, dimension, metric DEFAULT 'cosine', index_type DEFAULT 'hnsw', params DEFAULT '{}', data_dir DEFAULT '')`
-
-#### 1.4 数据同步（触发器）✅
-- [x] `zvec_sync_trigger()` 触发器：从 `TriggerData` 提取 pk（any type → 转 text via output function）+ float4[] 向量，发送 ZVEC_REQ_INSERT/ZVEC_REQ_DELETE
-- [x] `zvec_attach_table(collection, table, pk_col, vec_col)` — 通过 SPI 执行 `CREATE TRIGGER` 安装触发器
-- [x] NULL pk / NULL vector 行安全跳过
-- [x] 平铺二进制 pack/unpack 辅助函数定义在 `pg_zvec_shmem.h` 中（`zvec_pack_str/int/floats`, `zvec_unpack_str/int/floats`）
-
-**已知限制（记录于此供 Phase 2 改进）：**
-- UPDATE 时若 PK 发生变化，旧 PK 不会从 zvec 中删除（文档化限制；运行 `zvec_optimize()` 可触发后台 GC）
-- 触发器在行级立即发送 IPC（未缓冲至事务 COMMIT），rollback 后 zvec 可能有孤立向量
-- 单槽 IPC：同一时刻只有一个 backend 可以向 worker 发请求，并发写会得到"worker is busy"
-
-#### 1.5 检索函数 ✅
-- [x] `zvec_search(collection, query float4[], topk)` — SRF，backend 直接打开只读 handle 执行搜索（不走 worker IPC，无并发瓶颈）
-- [x] `zvec_search_filtered(collection, query float4[], topk, filter text)` — 同上 + 标量过滤表达式
-
-#### 1.6 崩溃恢复
-- [ ] 在 collection 元数据中记录 PG LSN 水位线
-- [ ] worker 启动时从 LSN 水位线之后重放 PG 的变更（或标记 collection 需要重建）
-
-#### Phase 1 验收标准（IPC 框架已全链路验证 ✅，需 USE_ZVEC=1 重建后进行完整功能验证）
-
+**SQL 扩展注册：**
 ```sql
--- 当前 API（dimension/metric 为显式参数）
-CREATE EXTENSION pg_zvec;
-CREATE TABLE items (id text PRIMARY KEY, embedding float4[]);
-SELECT zvec_create_collection('items_idx', 'items', 'embedding', 1536,
-       'cosine', 'hnsw', '{"m":16,"ef_construction":200}');
-SELECT zvec_attach_table('items_idx', 'items', 'id', 'embedding');
-
-INSERT INTO items VALUES ('doc1', array_fill(0.1::float4, ARRAY[1536]));
--- 触发器自动同步到 zvec（IPC → worker → zvec_collection_upsert）
-
-SELECT * FROM zvec_search('items_idx', array_fill(0.1::float4, ARRAY[1536]), 10);
--- → (pk text, score float4) 行集
+CREATE FUNCTION zvec_fdw_handler() RETURNS fdw_handler ...;
+CREATE FUNCTION zvec_fdw_validator(text[], oid) RETURNS void ...;
+CREATE FOREIGN DATA WRAPPER zvec_fdw
+    HANDLER zvec_fdw_handler
+    VALIDATOR zvec_fdw_validator;
 ```
 
-**Stub 模式下已验证行为：**
-- `CREATE EXTENSION / zvec_worker_status()` ✅
-- `zvec_create_collection()` IPC payload 全链路正确传递 ✅
-- `zvec_attach_table()` 通过 SPI 安装 AFTER 触发器 ✅
-- 触发器 fire (INSERT/DELETE)：提取 pk + float4[]，发送 IPC，worker 响应 WARNING ✅
-- `zvec_search()` 在 collection 不存在时返回明确错误 ✅
+#### 1.2 FDW Handler 骨架
+
+实现 `FdwRoutine` 的全部回调（大多数先返回 ereport/空实现）：
+
+**DDL 钩子（通过 ProcessUtility_hook 或 object_access_hook）：**
+- `CREATE FOREIGN TABLE` → 解析 OPTIONS，发送 `ZVEC_REQ_CREATE` 给 worker
+- `DROP FOREIGN TABLE` → 发送 `ZVEC_REQ_DROP` 给 worker
+
+**OPTIONS 验证（`zvec_fdw_validator`）：**
+```
+必需：dimension（正整数）
+可选：metric（cosine/l2/ip，默认 cosine）
+      index_type（hnsw/ivf/flat，默认 hnsw）
+      m、ef_construction、nlist（索引参数）
+```
+
+#### 1.3 Background Worker（复用 Phase 1 实现）
+
+- [ ] 复用已有 worker IPC 框架（`ZVEC_REQ_CREATE/DROP/INSERT/DELETE/OPTIMIZE`）
+- [ ] Worker 在启动时从 `pg_foreign_table` 系统表读取所有外部表，恢复 Collection 句柄
 
 ---
 
-### Phase 2 — 自定义向量类型 + 算符
+### Phase 2 — 距离算符 + ANN 下推
 
-**目标**：提供更符合 SQL 习惯的 API，与 pgvector 接口兼容。
+**目标**：`ORDER BY embedding <=> query LIMIT k` 自动走 zvec ANN 搜索路径。
 
-- [ ] 定义 `zvec` 类型（或复用 pgvector `vector` 类型）
-- [ ] 实现输入/输出函数：`'[0.1, 0.2, 0.3]'::zvec`
-- [ ] 定义距离算符：
-  - `<->` L2 距离
-  - `<=>` 余弦距离
-  - `<#>` 内积距离
-- [ ] 实现 `zvec_distance(a zvec, b zvec, metric text) → float4`
-- [ ] 支持 `ORDER BY embedding <=> query_vec LIMIT 10` 语法（通过 operator class）
+#### 2.1 自定义距离算符
+
+为 `float4[]` 定义三个距离算符（参考 pgvector 约定）：
+
+| 算符 | 语义 | zvec metric |
+|------|------|-------------|
+| `<->` | L2 距离 | `l2` |
+| `<=>` | 余弦距离 | `cosine` |
+| `<#>` | 负内积 | `ip` |
+
+```sql
+CREATE FUNCTION zvec_l2_distance(float4[], float4[]) RETURNS float4 ...;
+CREATE OPERATOR <-> (LEFTARG = float4[], RIGHTARG = float4[], FUNCTION = zvec_l2_distance, COMMUTATOR = <->);
+-- 同理 <=> 和 <#>
+```
+
+算符函数实现：
+- 有 zvec 时（`USE_ZVEC=1`）：调用 zvec 精确距离计算
+- 无 zvec 时：纯 C 实现（用于测试）
+
+#### 2.2 GetForeignPaths — ANN 路径识别
+
+`GetForeignPaths` 是 ANN 下推的核心。检测条件：
+
+```
+1. query pathkeys 包含 ORDER BY f(col, Param/Const) ASC
+2. f 是我们注册的距离算符之一
+3. 存在 LIMIT（通过 root->limit_tuples > 0 判断）
+4. col 是本外部表的向量列（对照 Options 中的 dimension 确认）
+```
+
+满足条件时，生成 `ForeignPath`，`fdw_private` 携带：
+```c
+typedef struct ZvecANNInfo {
+    int         vec_attno;      /* 向量列的属性编号 */
+    Oid         dist_op_oid;    /* 使用的距离算符 OID */
+    Node       *query_expr;     /* query vector 表达式（Const 或 Param）*/
+    double      limit_tuples;   /* LIMIT 值 */
+    List       *remote_conds;   /* 可下推的标量过滤条件 */
+    List       *local_conds;    /* 不可下推的条件（在 PG 层过滤）*/
+} ZvecANNInfo;
+```
+
+代价估算：
+- ANN 路径 startup_cost ≈ 0，total_cost ≈ k * per_tuple_cost（极低）
+- 顺序扫描路径按 doc_count 估算（通过 `zvec_stats()` 获取）
+
+#### 2.3 GetForeignPlan / BeginForeignScan / IterateForeignScan
+
+```c
+/* BeginForeignScan */
+void zvec_begin_foreign_scan(ForeignScanState *node, int eflags) {
+    // 从 fdw_private 反序列化 ZvecANNInfo
+    // 打开 zvec Collection 只读句柄（backend 内，无需 IPC）
+    // 若是 ANN 路径：执行 collection->search(query_vec, k, filter)
+    //   把结果暂存到 FdwScanState.results
+    // 若是顺序扫描路径：初始化 collection->full_scan() 游标
+}
+
+/* IterateForeignScan：逐行从 results 弹出 */
+TupleTableSlot *zvec_iterate_foreign_scan(ForeignScanState *node) {
+    // 从 results 取下一条，填充 slot
+}
+```
 
 ---
 
-### Phase 3 — Index Access Method（可选，长期目标）
+### Phase 3 — ForeignModify（INSERT / DELETE）
 
-**目标**：深度集成到 PG 查询优化器，支持 `CREATE INDEX USING zvec`。
+**目标**：`INSERT INTO` 和 `DELETE FROM` 正常工作。
 
-- [ ] 实现 `IndexAmRoutine`（ambuild, aminsert, amgettuple, amendscan 等）
-- [ ] 向量索引数据存储策略（外部文件 or PG relation pages）
-- [ ] 与 PG 查询规划器集成（`amcostestimate`）
-- [ ] 支持 `SET zvec.ef_search = 64` 等 session 级参数
+#### 3.1 INSERT
+
+```
+ExecForeignInsert
+  → 提取向量列 + 所有标量列
+  → 序列化为 IPC payload
+  → 发送 ZVEC_REQ_INSERT 给 worker
+  → 等待响应
+```
+
+**事务语义说明（已知限制）：**
+- 触发时机为语句执行时（非事务 COMMIT），rollback 后 zvec 可能有孤立向量
+- Phase 3 接受最终一致性；通过定期 `OPTIMIZE` GC 清理（类似 Elasticsearch 的 soft delete）
+
+#### 3.2 DELETE
+
+```
+ExecForeignDelete
+  → 从 plan 的 junk attribute 取出 zvec doc_id（或 PK）
+  → 发送 ZVEC_REQ_DELETE 给 worker
+```
+
+为支持 DELETE，`AddForeignUpdateTargets` 需将 PK 列标记为 junk target。
+
+#### 3.3 UPDATE（暂不支持）
+
+- FdwRoutine.ExecForeignUpdate = NULL（PG 会报 "foreign table does not support UPDATE"）
+- 用户可通过 DELETE + INSERT 实现
 
 ---
 
-## GUC 参数规划
+### Phase 4 — 标量过滤下推 + 高级特性
+
+**目标**：将 WHERE 条件下推到 zvec 的 filter engine（ANTLR SQL parser）。
+
+#### 4.1 条件分类（GetForeignPaths 中完成）
+
+```
+可下推：
+  - col = const（标量等值）
+  - col > / < / >= / <= const（标量范围）
+  - col LIKE 'prefix%'（string prefix，如 zvec 支持）
+
+不可下推：
+  - 跨表 JOIN 条件
+  - 复杂表达式
+  - 涉及非下推函数的条件
+```
+
+#### 4.2 条件转换为 zvec filter string
+
+实现 `deparse_expr()` 将 PG `Expr` 转换为 zvec filter SQL 字符串：
+```
+(pg) col = 'foo'::text  →  (zvec) "col" = 'foo'
+(pg) score > 0.5        →  (zvec) "score" > 0.5
+```
+
+#### 4.3 IMPORT FOREIGN SCHEMA
+
+实现 `ImportForeignSchema`，将 zvec data_dir 下已有的 Collection 批量导入为外部表。
+
+#### 4.4 GUC 参数
 
 ```ini
 # postgresql.conf
-pg_zvec.data_dir = ''           # 默认 $PGDATA/pg_zvec
+pg_zvec.ef_search = 64        # 全局 ef_search 覆盖（可被 SET LOCAL 覆盖）
 pg_zvec.query_threads = 4
 pg_zvec.optimize_threads = 2
-pg_zvec.max_buffer_size = '64MB'
 pg_zvec.log_level = 'warn'
 ```
 
 ---
 
-## 目录结构规划
+## 目录结构
 
 ```
 pg_zvec/
-├── PLAN.md                  # 本文件
-├── zvec/                    # zvec 源码（git submodule 或直接引用）
+├── PLAN.md
+├── zvec/                        # git submodule
 ├── src/
-│   ├── pg_zvec.c            # 扩展入口，SQL 函数注册
-│   ├── pg_zvec_worker.c     # Background Worker
-│   ├── pg_zvec_ipc.c        # 共享内存 / IPC 协议
-│   ├── pg_zvec_trigger.c    # 触发器实现
-│   ├── pg_zvec_search.c     # 检索函数
-│   ├── pg_zvec_type.c       # zvec 向量类型（Phase 2）
-│   └── pg_zvec_index.c      # Index AM（Phase 3）
+│   ├── pg_zvec_fdw.c            # FDwRoutine 全部回调（主文件）
+│   ├── pg_zvec_fdw.h            # FdwScanState、ZvecANNInfo 等内部结构
+│   ├── pg_zvec_pathkeys.c       # GetForeignPaths：ANN 路径识别逻辑
+│   ├── pg_zvec_deparse.c        # 条件表达式 → zvec filter string
+│   ├── pg_zvec_worker.c         # Background Worker（写路径 + 生命周期）
+│   ├── pg_zvec_shmem.c/h        # 共享内存 + IPC 协议
+│   └── zvec_bridge.cc/h         # C++ → C bridge（USE_ZVEC 守卫）
 ├── sql/
-│   ├── pg_zvec--1.0.sql     # 扩展 SQL 定义
-│   └── pg_zvec--1.0--1.1.sql
+│   ├── pg_zvec--2.0.sql         # FDW + 算符 + 算符类 SQL 定义
+│   └── pg_zvec--1.x--2.0.sql   # 升级脚本（如需）
 ├── pg_zvec.control
-├── Makefile                 # PGXS
-└── CMakeLists.txt           # 编译 zvec 静态库
+└── Makefile                     # PGXS
 ```
 
 ---
 
-## 已知风险与应对
+## 关键技术难点
+
+### T1：GetForeignPaths 中识别 ORDER BY 算符
+
+PG 规划器以 `PathKey` 列表表示排序需求。需要：
+1. 遍历 `root->query_pathkeys`
+2. 对每个 PathKey，检查其 `pk_eclass` 中的等价成员
+3. 识别形如 `OpExpr(our_op, Var(our_rel, vec_attno), param_or_const)` 的表达式
+4. 确认 `pk_strategy = BTLessStrategyNumber`（ASC，最近邻排前面）
+
+参考实现：`postgres_fdw` 的 `find_em_for_rel()`，`multicorn` 的 pathkeys 处理。
+
+### T2：query vector 的运行时求值
+
+query vector 可能是参数（Prepared Statement）或常量：
+- 常量：在 `GetForeignPlan` 时直接序列化进 `fdw_private`
+- 参数（Param）：在 `BeginForeignScan` 时通过 `ExecEvalExpr` 求值
+
+### T3：zvec Collection 生命周期与 `CREATE FOREIGN TABLE` 的绑定
+
+`CREATE FOREIGN TABLE` 是标准 DDL，PG 不提供 FDW 回调。需要使用：
+- `object_access_hook`：`OAT_POST_CREATE` 对 `ForeignTableRelationId` 触发创建
+- `object_access_hook`：`OAT_DROP` 触发销毁
+
+或者：在 `BeginForeignScan` / `BeginForeignModify` 时懒惰创建 Collection（首次访问时创建）。
+
+### T4：多进程只读句柄安全性
+
+zvec 的只读句柄是否线程/进程安全需验证（见 zvec `collection.h`）。
+如果不安全，需每次 BeginForeignScan 打开、EndForeignScan 关闭（开销可接受，因为 ANN 搜索耗时远大于句柄开销）。
+
+---
+
+## 已知限制（Phase 2-3 接受）
+
+| 限制 | 说明 | 未来改进 |
+|------|------|----------|
+| 不支持 UPDATE | 需 DELETE + INSERT | Phase 4 |
+| 写不随事务回滚 | zvec WAL ≠ PG WAL | 长期：Logical Replication 槽 |
+| 单写者串行化 | worker IPC 瓶颈 | 评估 zvec 多进程写安全性后改进 |
+| ORDER BY 必须包含 LIMIT | 无 LIMIT 时退化为顺序扫描 | 可接受 |
+| 向量列类型为 float4[] | 非 zvec 专属类型，无类型安全 | Phase 4：定义 zvec 类型 |
+
+---
+
+## 已知风险
 
 | 风险 | 应对 |
 |------|------|
-| RocksDB 符号与 PG 或其他扩展冲突 | 静态链接 + `-fvisibility=hidden` |
-| worker 崩溃导致 collection 状态不一致 | LSN 水位线 + 重启重放 |
-| 大量数据 rollback 后 zvec 有孤立向量 | 后台 GC 任务定期清理不在 PG heap 中的 doc_id |
-| zvec 未内置 PG MVCC 可见性 | Phase 1 接受最终一致性；Phase 3 通过 TAM 解决 |
+| RocksDB 符号与 PG 冲突 | 静态链接 + `-fvisibility=hidden` |
+| GetForeignPaths 识别失败（退化顺序扫描） | 增加 EXPLAIN 输出调试信息，文档化触发条件 |
+| zvec 只读句柄多进程安全性未知 | 验证后决定是否加 lwlock 保护 |
 | 编译依赖复杂（RocksDB / Arrow / Protobuf） | Docker 构建环境，CI 固定依赖版本 |
+
+---
+
+## 验收标准
+
+### Phase 1
+```sql
+CREATE EXTENSION pg_zvec;
+CREATE SERVER zvec_server FOREIGN DATA WRAPPER zvec_fdw OPTIONS (data_dir '/tmp/zvec_data');
+CREATE FOREIGN TABLE vecs (id text, emb float4[]) SERVER zvec_server OPTIONS (dimension '4', metric 'cosine');
+-- zvec Collection 被创建
+DROP FOREIGN TABLE vecs;
+-- zvec Collection 被销毁
+```
+
+### Phase 2
+```sql
+INSERT INTO vecs VALUES ('a', '{1,0,0,0}'), ('b', '{0,1,0,0}'), ('c', '{0,0,1,0}');
+EXPLAIN SELECT id FROM vecs ORDER BY emb <=> '{1,0.1,0,0}' LIMIT 3;
+-- 输出中出现 "Foreign Scan on vecs" + "ZvecANN: k=3 metric=cosine"
+SELECT id FROM vecs ORDER BY emb <=> '{1,0.1,0,0}' LIMIT 3;
+-- → 返回 a, b, c（按余弦距离排序）
+```
+
+### Phase 3
+```sql
+INSERT INTO vecs VALUES ('d', '{0,0,0,1}');
+-- INSERT 通过 ForeignModify → worker IPC 成功
+DELETE FROM vecs WHERE id = 'a';
+-- DELETE 通过 ForeignModify → worker IPC 成功
+```
 
 ---
 
@@ -183,6 +402,5 @@ pg_zvec/
 
 | 日期 | 变更 |
 |------|------|
-| 2026-02-22 | 初始调研完成，创建 PLAN.md，确定三阶段路线 |
-| 2026-02-22 | Phase 1.1 脚手架完成，验证 CREATE EXTENSION 和 zvec_worker_status() |
-| 2026-02-22 | Phase 1.2–1.5 完成：IPC 序列化、worker Collection 注册表、管理函数、触发器、搜索函数。全链路 IPC 验证通过（stub 模式） |
+| 2026-02-22 | 初始函数式 API 方案（Phase 1 完成） |
+| 2026-02-23 | 架构重新设计：放弃函数式 API，改为 FDW + ANN 下推方案 |
