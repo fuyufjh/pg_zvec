@@ -1,0 +1,114 @@
+-- 07_pk_types.sql
+-- Test: INSERT/DELETE work correctly for various pk column types.
+--
+-- Regression for the TextDatumGetCString bug: calling it on a non-text datum
+-- (int4, int8, uuid …) treats the datum value as a pointer → SIGSEGV.
+-- Fix: use OidOutputFunctionCall so any type is serialised via its output fn.
+--
+-- Each sub-test uses its own foreign table (and therefore its own on-disk
+-- collection directory) to keep tests independent.
+
+CREATE EXTENSION pg_zvec;
+CREATE SERVER zvec_server FOREIGN DATA WRAPPER zvec_fdw
+    OPTIONS (data_dir '/tmp/zvec_pk_types_test');
+
+-- ------------------------------------------------------------
+-- 1. integer pk
+-- ------------------------------------------------------------
+CREATE FOREIGN TABLE t_int_pk (id int, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '4');
+
+INSERT INTO t_int_pk VALUES (1,  '{1,0,0,0}');
+INSERT INTO t_int_pk VALUES (2,  '{0,1,0,0}');
+INSERT INTO t_int_pk VALUES (-1, '{0,0,1,0}');
+
+-- verify DELETE does not crash (no scan rows → no-op is fine too)
+DELETE FROM t_int_pk WHERE id = 1;
+
+DROP FOREIGN TABLE t_int_pk;
+
+-- ------------------------------------------------------------
+-- 2. bigint pk
+-- ------------------------------------------------------------
+CREATE FOREIGN TABLE t_bigint_pk (id bigint, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '4');
+
+INSERT INTO t_bigint_pk VALUES (9223372036854775807, '{1,0,0,0}');
+INSERT INTO t_bigint_pk VALUES (0,                   '{0,1,0,0}');
+
+DROP FOREIGN TABLE t_bigint_pk;
+
+-- ------------------------------------------------------------
+-- 3. uuid pk
+-- ------------------------------------------------------------
+CREATE FOREIGN TABLE t_uuid_pk (id uuid, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '4');
+
+INSERT INTO t_uuid_pk VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '{1,0,0,0}');
+INSERT INTO t_uuid_pk VALUES ('550e8400-e29b-41d4-a716-446655440000', '{0,1,0,0}');
+
+DROP FOREIGN TABLE t_uuid_pk;
+
+-- ------------------------------------------------------------
+-- 4. text pk (existing behaviour — must still work)
+-- ------------------------------------------------------------
+CREATE FOREIGN TABLE t_text_pk (id text, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '4');
+
+INSERT INTO t_text_pk VALUES ('hello', '{1,0,0,0}');
+INSERT INTO t_text_pk VALUES ('world', '{0,1,0,0}');
+
+DROP FOREIGN TABLE t_text_pk;
+
+-- ------------------------------------------------------------
+-- 5. Extra non-vector columns are silently ignored
+--    (pk = col 1, vector = first float4[]; others skipped)
+-- ------------------------------------------------------------
+CREATE FOREIGN TABLE t_extra_cols (
+    id       int,
+    emb      float4[],
+    label    text,
+    metadata jsonb
+) SERVER zvec_server OPTIONS (dimension '4');
+
+INSERT INTO t_extra_cols VALUES (1, '{1,0,0,0}', 'cat',  '{"score": 0.9}');
+INSERT INTO t_extra_cols VALUES (2, '{0,1,0,0}', 'dog',  NULL);
+INSERT INTO t_extra_cols VALUES (3, '{0,0,1,0}', NULL,   '{}');
+
+DROP FOREIGN TABLE t_extra_cols;
+
+-- ------------------------------------------------------------
+-- 6. NULL pk is still rejected regardless of type
+-- ------------------------------------------------------------
+CREATE FOREIGN TABLE t_null_check (id int, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '4');
+
+DO $$
+BEGIN
+    INSERT INTO t_null_check VALUES (NULL, '{1,0,0,0}');
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'null pk rejected: %', SQLERRM;
+END;
+$$;
+
+DROP FOREIGN TABLE t_null_check;
+
+-- ------------------------------------------------------------
+-- 7. Dimension mismatch is still caught for non-text pk tables
+-- ------------------------------------------------------------
+CREATE FOREIGN TABLE t_dim_check (id int, emb float4[])
+    SERVER zvec_server OPTIONS (dimension '4');
+
+DO $$
+BEGIN
+    INSERT INTO t_dim_check VALUES (1, '{1,0,0,0,0}');
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'dimension mismatch rejected: %', SQLERRM;
+END;
+$$;
+
+DROP FOREIGN TABLE t_dim_check;
+
+-- Teardown
+DROP SERVER zvec_server CASCADE;
+DROP EXTENSION pg_zvec CASCADE;
