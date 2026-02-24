@@ -51,6 +51,14 @@ parse_index_type(const char *index_type)
     return zvec::IndexType::HNSW;       /* default */
 }
 
+static zvec::DataType
+parse_vec_type(const char *vec_type)
+{
+    if (strcasecmp(vec_type, "vector_fp16") == 0)
+        return zvec::DataType::VECTOR_FP16;
+    return zvec::DataType::VECTOR_FP32;  /* default */
+}
+
 extern "C" {
 
 ZvecCollectionHandle *
@@ -58,19 +66,21 @@ zvec_collection_create(const char *data_dir,
                        const char *index_type,
                        const char *metric,
                        int         dimension,
+                       const char *vec_type,
                        const char * /* params_json – TODO: parse */,
                        char       *errbuf,
                        int         errbuf_len)
 {
     auto metric_type = parse_metric(metric);
     auto idx_type    = parse_index_type(index_type);
+    auto data_type   = parse_vec_type(vec_type);
     (void)idx_type; /* TODO: use idx_type to select HNSW/IVF/FLAT */
 
     /* Build schema with a single vector field named "embedding" */
     zvec::CollectionSchema schema("default");
     auto vec_field = std::make_shared<zvec::FieldSchema>(
         "embedding",
-        zvec::DataType::VECTOR_FP32,
+        data_type,
         static_cast<uint32_t>(dimension),
         /*nullable=*/false,
         std::make_shared<zvec::HnswIndexParams>(metric_type));
@@ -356,7 +366,7 @@ extern "C" {
 
 ZvecCollectionHandle *
 zvec_collection_create(const char *, const char *, const char *, int,
-                       const char *, char *errbuf, int errbuf_len)
+                       const char *, const char *, char *errbuf, int errbuf_len)
 { stub_err(errbuf, errbuf_len, "zvec_collection_create"); return nullptr; }
 
 ZvecCollectionHandle *

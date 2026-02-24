@@ -30,6 +30,7 @@ typedef struct ZvecCollectionHandle ZvecCollectionHandle;
  * index_type: "hnsw" | "ivf" | "flat"
  * metric:     "l2" | "ip" | "cosine"
  * dimension:  vector dimension
+ * vec_type:   "vector_fp32" | "vector_fp16"
  * params_json: optional extra parameters as JSON string (may be NULL)
  *
  * Returns NULL on failure; sets errbuf.
@@ -38,6 +39,7 @@ ZvecCollectionHandle *zvec_collection_create(const char *data_dir,
                                               const char *index_type,
                                               const char *metric,
                                               int         dimension,
+                                              const char *vec_type,
                                               const char *params_json,
                                               char       *errbuf,
                                               int         errbuf_len);

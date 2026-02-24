@@ -56,6 +56,7 @@ typedef struct ZvecCollectionEntry
     char    data_dir[ZVEC_MAX_PATH_LEN];
     char    index_type[32];     /* "hnsw" | "ivf" | "flat" */
     char    metric[16];         /* "l2"   | "ip"  | "cosine" */
+    char    vec_type[16];       /* "vector_fp32" | "vector_fp16" */
     int32   dimension;
 } ZvecCollectionEntry;
 

@@ -77,6 +77,32 @@ static shmem_request_hook_type      prev_shmem_request_hook    = NULL;
  * ---------------------------------------------------------------- */
 
 /*
+ * zvec_get_vec_type_for_column — read the "type" column option for a given
+ * attno.  Returns ZVEC_VEC_FP32 by default if no option is specified.
+ */
+static int
+zvec_get_vec_type_for_column(Oid relid, AttrNumber attno)
+{
+    List     *options;
+    ListCell *lc;
+
+    options = GetForeignColumnOptions(relid, attno);
+    foreach(lc, options)
+    {
+        DefElem *def = (DefElem *) lfirst(lc);
+        if (strcmp(def->defname, "type") == 0)
+        {
+            const char *v = defGetString(def);
+            if (strcasecmp(v, "vector_fp16") == 0)
+                return ZVEC_VEC_FP16;
+            else
+                return ZVEC_VEC_FP32;
+        }
+    }
+    return ZVEC_VEC_FP32; /* default */
+}
+
+/*
  * zvec_table_options — extract zvec-specific OPTIONS from a ForeignTable.
  *
  * All output pointers are palloc'd strings or default values.
@@ -268,6 +294,10 @@ zvec_create_collection_for_table(Oid relid)
     ZvecRequest    req;
     ZvecResponse   resp;
     int            pos = 0;
+    int            vec_attno = -1;
+    int            vec_type  = ZVEC_VEC_FP32;
+    TupleDesc      tupdesc;
+    int            i;
 
     ft     = GetForeignTable(relid);
     server = GetForeignServer(ft->serverid);
@@ -279,6 +309,19 @@ zvec_create_collection_for_table(Oid relid)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("pg_zvec: foreign table must specify a positive \"dimension\" option")));
+
+    /* Locate first float4[] column to read its vec_type option */
+    tupdesc = RelationGetDescr(RelationIdGetRelation(relid));
+    for (i = 0; i < tupdesc->natts; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+        if (!attr->attisdropped && attr->atttypid == FLOAT4ARRAYOID)
+        {
+            vec_attno = i + 1;  /* 1-based */
+            vec_type  = zvec_get_vec_type_for_column(relid, vec_attno);
+            break;
+        }
+    }
 
     /* Collection name = relation name (schema-unqualified) */
     strlcpy(col_name, get_rel_name(relid), sizeof(col_name));
@@ -299,6 +342,9 @@ zvec_create_collection_for_table(Oid relid)
     pos = zvec_pack_str(req.data, pos, sizeof(req.data), metric);
     if (pos < 0) goto overflow;
     pos = zvec_pack_int(req.data, pos, sizeof(req.data), dimension);
+    if (pos < 0) goto overflow;
+    pos = zvec_pack_str(req.data, pos, sizeof(req.data),
+                        (vec_type == ZVEC_VEC_FP16) ? "vector_fp16" : "vector_fp32");
     if (pos < 0) goto overflow;
     pos = zvec_pack_str(req.data, pos, sizeof(req.data), params_json);
     if (pos < 0) goto overflow;
@@ -544,12 +590,15 @@ zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
 
     /* Locate first float4[] column */
     state->vec_attno = -1;
+    state->vec_type  = ZVEC_VEC_FP32;
     for (i = 0; i < tupdesc->natts; i++)
     {
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
         if (!attr->attisdropped && attr->atttypid == FLOAT4ARRAYOID)
         {
             state->vec_attno = i + 1;   /* 1-based */
+            state->vec_type  = zvec_get_vec_type_for_column(RelationGetRelid(rel),
+                                                             state->vec_attno);
             break;
         }
     }
@@ -819,12 +868,15 @@ zvec_begin_foreign_modify(ModifyTableState *mtstate,
 
     /* Vector column: first float4[] attribute */
     mstate->vec_attno = -1;
+    mstate->vec_type  = ZVEC_VEC_FP32;
     for (i = 0; i < tupdesc->natts; i++)
     {
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
         if (!attr->attisdropped && attr->atttypid == FLOAT4ARRAYOID)
         {
             mstate->vec_attno = i + 1;  /* 1-based */
+            mstate->vec_type  = zvec_get_vec_type_for_column(RelationGetRelid(rel),
+                                                              mstate->vec_attno);
             break;
         }
     }
@@ -1094,6 +1146,26 @@ zvec_fdw_validator(PG_FUNCTION_ARGS)
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("pg_zvec: unrecognised server option \"%s\"",
                                 def->defname)));
+        }
+        else if (catalog == AttributeRelationId)
+        {
+            /* Column-level options: only "type" is allowed */
+            if (strcmp(def->defname, "type") == 0)
+            {
+                const char *v = defGetString(def);
+                if (strcasecmp(v, "vector_fp32") != 0 &&
+                    strcasecmp(v, "vector_fp16") != 0)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                             errmsg("pg_zvec: column option \"type\" must be vector_fp32 or vector_fp16")));
+            }
+            else
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("pg_zvec: unrecognised column option \"%s\"",
+                                def->defname)));
+            }
         }
     }
 

@@ -142,7 +142,7 @@ process_request(void)
         /* --------------------------------------------------------
          * CREATE_COLLECTION
          * Payload: [name\0][data_dir\0][index_type\0][metric\0]
-         *          [dimension: int32][params_json\0]
+         *          [dimension: int32][vec_type\0][params_json\0]
          * -------------------------------------------------------- */
         case ZVEC_REQ_CREATE_COLLECTION:
         {
@@ -151,6 +151,7 @@ process_request(void)
             char index_type[32];
             char metric[32];
             int  dimension;
+            char vec_type[32];
             char params_json[ZVEC_MAX_PARAMS_LEN];
             char errbuf[256];
             int  pos = 0;
@@ -173,6 +174,9 @@ process_request(void)
             pos = zvec_unpack_int(req.data, pos, req.data_len, &dimension);
             if (pos < 0) goto unpack_error;
             pos = zvec_unpack_str(req.data, pos, req.data_len,
+                                  vec_type, sizeof(vec_type));
+            if (pos < 0) goto unpack_error;
+            pos = zvec_unpack_str(req.data, pos, req.data_len,
                                   params_json, sizeof(params_json));
             if (pos < 0) goto unpack_error;
 
@@ -190,7 +194,7 @@ process_request(void)
 
             /* Create collection on disk */
             h = zvec_collection_create(data_dir, index_type, metric,
-                                       dimension, params_json,
+                                       dimension, vec_type, params_json,
                                        errbuf, sizeof(errbuf));
             if (!h)
             {
@@ -230,6 +234,7 @@ process_request(void)
             strlcpy(entry->data_dir,   data_dir,   sizeof(entry->data_dir));
             strlcpy(entry->index_type, index_type, sizeof(entry->index_type));
             strlcpy(entry->metric,     metric,     sizeof(entry->metric));
+            strlcpy(entry->vec_type,   vec_type,   sizeof(entry->vec_type));
             entry->dimension   = dimension;
             pg_zvec_state->num_collections++;
             LWLockRelease(pg_zvec_state->lock);

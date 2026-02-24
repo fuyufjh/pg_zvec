@@ -11,6 +11,12 @@
 #include "fmgr.h"
 
 /* ----------------------------------------------------------------
+ * Vector storage type constants
+ * ---------------------------------------------------------------- */
+#define ZVEC_VEC_FP32  0
+#define ZVEC_VEC_FP16  1
+
+/* ----------------------------------------------------------------
  * GUC parameters (defined in pg_zvec_fdw.c)
  * ---------------------------------------------------------------- */
 extern char *pg_zvec_data_dir;
@@ -41,6 +47,7 @@ typedef struct ZvecFdwScanState
     int         dimension;       /* vector dimension */
     int         pk_attno;        /* 1-based attno of pk column */
     int         vec_attno;       /* 1-based attno of float4[] column */
+    int         vec_type;        /* ZVEC_VEC_FP32 or ZVEC_VEC_FP16 */
     int         natts;           /* number of table attributes */
     char      (*pks)[256];       /* [nrows][256] pk strings */
     float      *vecs;            /* [nrows * dimension] float32 values */
@@ -61,6 +68,7 @@ typedef struct ZvecFdwModifyState
     char        collection_name[128];   /* zvec collection name (= relation name) */
     int         pk_attno;               /* 1-based attno of pk column */
     int         vec_attno;              /* 1-based attno of float4[] column */
+    int         vec_type;               /* ZVEC_VEC_FP32 or ZVEC_VEC_FP16 */
     int         dimension;              /* expected vector length */
     AttrNumber  pk_junk_attno;          /* junk attno in planSlot (DELETE only) */
     Oid         pk_typoutput;           /* output function OID for pk type */
