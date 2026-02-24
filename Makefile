@@ -40,8 +40,10 @@ ZVEC_LIB    := $(ZVEC_BUILD)/lib
 ZVEC_ARROW  := $(ZVEC_BUILD)/thirdparty/arrow/arrow/src/ARROW.BUILD-build
 SHLIB_LINK += \
 	$(ZVEC_LIB)/libzvec_db.a \
+	-Wl,--whole-archive \
 	$(ZVEC_LIB)/libzvec_core.a \
 	$(ZVEC_LIB)/libzvec_ailego.a \
+	-Wl,--no-whole-archive \
 	$(ZVEC_LIB)/libzvec_proto.a \
 	$(ZVEC_EXT)/libparquet.a \
 	$(ZVEC_EXT)/libarrow_dataset.a \
