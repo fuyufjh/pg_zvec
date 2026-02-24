@@ -1,0 +1,78 @@
+-- 09_all_types.sql
+-- Test: CRUD operations covering all supported column types.
+--
+-- zvec Field (scalar) types:
+--   STRING -> text,  BOOL -> boolean,  INT32 -> integer,
+--   INT64  -> bigint, FLOAT -> real,   DOUBLE -> double precision
+--
+-- zvec Vector types:
+--   VECTOR_FP32 -> real[]  (default)
+--   VECTOR_FP16 -> real[]  (column option type = 'vector_fp16')
+
+-- Setup
+CREATE EXTENSION pg_zvec;
+CREATE SERVER zvec_server FOREIGN DATA WRAPPER zvec_fdw
+    OPTIONS (data_dir '/tmp/zvec_09_types');
+
+-- ============================================================
+-- 1. Main table: every scalar + vector column type
+-- ============================================================
+CREATE FOREIGN TABLE t_all_types (
+    id         text,
+    str_col    text,
+    bool_col   boolean,
+    int32_col  integer,
+    int64_col  bigint,
+    float_col  real,
+    double_col double precision,
+    vec_fp32   float4[],
+    vec_fp16   float4[] OPTIONS (type 'vector_fp16')
+) SERVER zvec_server OPTIONS (dimension '4');
+
+-- INSERT rows covering every scalar type
+INSERT INTO t_all_types VALUES (
+    'row1', 'hello world', true,
+    42, 9223372036854775807, 3.14, 2.718281828459045,
+    '{1,0,0,0}', '{0,1,0,0}'
+);
+
+INSERT INTO t_all_types VALUES (
+    'row2', 'test string', false,
+    -100, -9223372036854775808, -0.5, -1.414213562373095,
+    '{0,1,0,0}', '{0,0,1,0}'
+);
+
+INSERT INTO t_all_types VALUES (
+    'row3', NULL, true,
+    0, 0, 0.0, 0.0,
+    '{0,0,1,0}', '{0,0,0,1}'
+);
+
+-- READ: SELECT all scalar columns
+SELECT id, str_col, bool_col, int32_col, int64_col, float_col, double_col
+FROM t_all_types
+ORDER BY id;
+
+-- Scalar subset
+SELECT id, str_col, bool_col FROM t_all_types ORDER BY id;
+
+-- WHERE on each scalar type
+SELECT id FROM t_all_types WHERE bool_col = true ORDER BY id;
+SELECT id FROM t_all_types WHERE int32_col = 42 ORDER BY id;
+SELECT id FROM t_all_types WHERE int64_col = 9223372036854775807 ORDER BY id;
+SELECT id FROM t_all_types WHERE float_col > 0 ORDER BY id;
+SELECT id FROM t_all_types WHERE double_col > 1.0 ORDER BY id;
+
+-- NULL handling
+SELECT id FROM t_all_types WHERE str_col IS NULL ORDER BY id;
+SELECT id FROM t_all_types WHERE str_col IS NOT NULL ORDER BY id;
+
+-- DELETE one row and verify count
+DELETE FROM t_all_types WHERE id = 'row3';
+
+SELECT COUNT(*) AS remaining_rows FROM t_all_types;
+
+-- Teardown
+DROP FOREIGN TABLE t_all_types;
+DROP SERVER zvec_server CASCADE;
+DROP EXTENSION pg_zvec CASCADE;

@@ -70,7 +70,7 @@ endif
 # ---- Regression tests -------------------------------------------------------
 # Run with:
 #   PGHOST=/tmp/pg_zvec_socket PGPORT=5499 make installcheck
-REGRESS      = 01_extension 02_server 03_table_options 04_ddl 05_scan 06_modify 07_pk_types
+REGRESS      = 01_extension 02_server 03_table_options 04_ddl 05_scan 06_modify 07_pk_types 09_all_types
 REGRESS_OPTS = \
 	--inputdir=test \
 	--outputdir=test \
