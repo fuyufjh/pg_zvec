@@ -14,6 +14,8 @@
 #include "pg_zvec_shmem.h"
 #include "zvec_bridge/zvec_bridge.h"
 
+#include <stdio.h>
+
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "catalog/namespace.h"
@@ -504,28 +506,232 @@ zvec_get_foreign_plan(PlannerInfo      *root,
 static void
 zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
 {
-    ZvecFdwScanState *state = palloc0(sizeof(ZvecFdwScanState));
-    state->done = true; /* Phase 1: always empty */
+    Relation             rel     = node->ss.ss_currentRelation;
+    TupleDesc            tupdesc = RelationGetDescr(rel);
+    ForeignTable        *ft;
+    ForeignServer       *server;
+    char                *data_dir, *metric, *index_type, *params_json;
+    int                  dimension;
+    ZvecFdwScanState    *state;
+    char                 col_name[ZVEC_MAX_NAME_LEN];
+    char                 errbuf[256];
+    Oid                  pk_typinput;
+    int                  i;
+
+    state = palloc0(sizeof(ZvecFdwScanState));
+
+    if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+    {
+        state->done = true;
+        node->fdw_state = state;
+        return;
+    }
+
+    /* Get FDW options */
+    ft     = GetForeignTable(RelationGetRelid(rel));
+    server = GetForeignServer(ft->serverid);
+    zvec_table_options(ft, server, &data_dir, &dimension,
+                       &metric, &index_type, &params_json);
+    state->dimension = dimension;
+    state->natts     = tupdesc->natts;
+
+    /* Locate PK column (attno 1) */
+    state->pk_attno     = 1;
+    state->pk_atttypmod = TupleDescAttr(tupdesc, 0)->atttypmod;
+    getTypeInputInfo(TupleDescAttr(tupdesc, 0)->atttypid,
+                     &pk_typinput, &state->pk_typioparam);
+    fmgr_info(pk_typinput, &state->pk_finfo);
+
+    /* Locate first float4[] column */
+    state->vec_attno = -1;
+    for (i = 0; i < tupdesc->natts; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+        if (!attr->attisdropped && attr->atttypid == FLOAT4ARRAYOID)
+        {
+            state->vec_attno = i + 1;   /* 1-based */
+            break;
+        }
+    }
+
+    if (state->vec_attno < 0 || dimension <= 0)
+    {
+        state->done = true;
+        node->fdw_state = state;
+        return;
+    }
+
+    /* ----------------------------------------------------------------
+     * Route the scan through the background worker.
+     *
+     * zvec uses an exclusive file lock for write handles.  The worker
+     * owns the write handle, so we cannot open a read-only handle
+     * concurrently.  Instead we send ZVEC_REQ_SCAN; the worker calls
+     * zvec_collection_scan_all() and writes the results to a tmpfile.
+     * ---------------------------------------------------------------- */
+    strlcpy(col_name, RelationGetRelationName(rel), sizeof(col_name));
+
+    {
+        ZvecRequest  req;
+        ZvecResponse resp;
+        char         tmpfile[ZVEC_MAX_PATH_LEN];
+        int          max_rows = ZVEC_SCAN_MAX_ROWS;
+        int          pos = 0;
+        FILE        *fp;
+        int          nrows = 0;
+        char       (*pks)[256] = NULL;
+        float       *vecs = NULL;
+
+        snprintf(tmpfile, sizeof(tmpfile),
+                 "/tmp/pg_zvec_scan_%d.bin", MyProcPid);
+
+        memset(&req, 0, sizeof(req));
+        req.type        = ZVEC_REQ_SCAN;
+        req.database_id = MyDatabaseId;
+
+        pos = zvec_pack_str(req.data, pos, sizeof(req.data), col_name);
+        if (pos < 0) goto overflow;
+        pos = zvec_pack_int(req.data, pos, sizeof(req.data), max_rows);
+        if (pos < 0) goto overflow;
+        pos = zvec_pack_int(req.data, pos, sizeof(req.data), dimension);
+        if (pos < 0) goto overflow;
+        pos = zvec_pack_str(req.data, pos, sizeof(req.data), tmpfile);
+        if (pos < 0) goto overflow;
+        req.data_len = pos;
+
+        if (!send_worker_request(&req, &resp, 30000, errbuf, sizeof(errbuf)))
+        {
+            ereport(WARNING,
+                    (errmsg("pg_zvec: scan request failed for \"%s\": %s",
+                            col_name, errbuf)));
+            state->done = true;
+            node->fdw_state = state;
+            return;
+        }
+
+        /* Read results from tmpfile */
+        fp = fopen(tmpfile, "rb");
+        if (fp)
+        {
+            if (fread(&nrows, sizeof(int), 1, fp) == 1 && nrows > 0)
+            {
+                pks  = (char (*)[256]) palloc(nrows * 256);
+                vecs = (float *) palloc((Size)((int64) nrows * dimension
+                                               * (int64) sizeof(float)));
+                if (fread(pks, 256, nrows, fp) != (size_t) nrows ||
+                    fread(vecs, sizeof(float) * dimension, nrows, fp) != (size_t) nrows)
+                {
+                    /* Partial read — treat as empty */
+                    pfree(pks);
+                    pfree(vecs);
+                    pks   = NULL;
+                    vecs  = NULL;
+                    nrows = 0;
+                }
+            }
+            fclose(fp);
+            unlink(tmpfile);
+        }
+        else
+        {
+            ereport(WARNING,
+                    (errmsg("pg_zvec: could not open scan results for \"%s\"",
+                            col_name)));
+        }
+
+        state->nrows = nrows;
+        state->pks   = pks;
+        state->vecs  = vecs;
+        state->done  = (nrows == 0);
+    }
+
+    node->fdw_state = state;
+    return;
+
+overflow:
+    ereport(WARNING,
+            (errmsg("pg_zvec: IPC buffer overflow building SCAN request")));
+    state->done = true;
     node->fdw_state = state;
 }
 
 static TupleTableSlot *
 zvec_iterate_foreign_scan(ForeignScanState *node)
 {
-    /* Return empty slot — no rows in Phase 1 */
-    return ExecClearTuple(node->ss.ss_ScanTupleSlot);
+    ZvecFdwScanState *state  = (ZvecFdwScanState *) node->fdw_state;
+    TupleTableSlot   *slot   = node->ss.ss_ScanTupleSlot;
+    TupleDesc         tupdesc = slot->tts_tupleDescriptor;
+    int               natts  = tupdesc->natts;
+    int               i;
+
+    if (state->done || state->cur >= state->nrows)
+        return ExecClearTuple(slot);
+
+    ExecClearTuple(slot);
+
+    /* Default all columns to NULL */
+    for (i = 0; i < natts; i++)
+    {
+        slot->tts_values[i] = (Datum) 0;
+        slot->tts_isnull[i] = true;
+    }
+
+    /* Fill PK column (attno 1) */
+    {
+        char  *pk_str   = state->pks[state->cur];
+        Datum  pk_datum = InputFunctionCall(&state->pk_finfo,
+                                            pk_str,
+                                            state->pk_typioparam,
+                                            state->pk_atttypmod);
+        slot->tts_values[state->pk_attno - 1] = pk_datum;
+        slot->tts_isnull[state->pk_attno - 1] = false;
+    }
+
+    /* Fill vector column (first float4[]) */
+    if (state->vec_attno >= 1 && state->vec_attno <= natts)
+    {
+        float     *vec   = state->vecs + (int64) state->cur * state->dimension;
+        int        dim   = state->dimension;
+        Datum     *elems = (Datum *) palloc(dim * sizeof(Datum));
+        int        dims[1] = {dim};
+        int        lbs[1]  = {1};
+        ArrayType *arr;
+
+        for (i = 0; i < dim; i++)
+            elems[i] = Float4GetDatum(vec[i]);
+
+        arr = construct_md_array(elems, NULL, 1, dims, lbs,
+                                 FLOAT4OID, sizeof(float4), true, TYPALIGN_INT);
+        pfree(elems);
+
+        slot->tts_values[state->vec_attno - 1] = PointerGetDatum(arr);
+        slot->tts_isnull[state->vec_attno - 1] = false;
+    }
+
+    ExecStoreVirtualTuple(slot);
+    state->cur++;
+    return slot;
 }
 
 static void
 zvec_rescan_foreign_scan(ForeignScanState *node)
 {
-    /* no-op */
+    ZvecFdwScanState *state = (ZvecFdwScanState *) node->fdw_state;
+    if (state)
+        state->cur = 0;
 }
 
 static void
 zvec_end_foreign_scan(ForeignScanState *node)
 {
-    /* no-op */
+    ZvecFdwScanState *state = (ZvecFdwScanState *) node->fdw_state;
+    if (state)
+    {
+        if (state->pks)  pfree(state->pks);
+        if (state->vecs) pfree(state->vecs);
+        pfree(state);
+        node->fdw_state = NULL;
+    }
 }
 
 /* ----------------------------------------------------------------

@@ -34,8 +34,20 @@ PGDLLEXPORT void pg_zvec_worker_main(Datum main_arg);
  * ---------------------------------------------------------------- */
 typedef struct ZvecFdwScanState
 {
-    /* filled in BeginForeignScan, used by IterateForeignScan */
-    bool    done;
+    bool        done;            /* true → scan is exhausted */
+    /* result buffers (palloc'd in BeginForeignScan) */
+    int         nrows;           /* total rows fetched from zvec */
+    int         cur;             /* next row to return (0-based) */
+    int         dimension;       /* vector dimension */
+    int         pk_attno;        /* 1-based attno of pk column */
+    int         vec_attno;       /* 1-based attno of float4[] column */
+    int         natts;           /* number of table attributes */
+    char      (*pks)[256];       /* [nrows][256] pk strings */
+    float      *vecs;            /* [nrows * dimension] float32 values */
+    /* for converting pk string → Datum */
+    Oid         pk_typioparam;
+    int32       pk_atttypmod;
+    FmgrInfo    pk_finfo;        /* pg input function for pk type */
 } ZvecFdwScanState;
 
 /* ----------------------------------------------------------------

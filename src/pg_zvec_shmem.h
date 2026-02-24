@@ -31,6 +31,18 @@ typedef enum ZvecRequestType
     ZVEC_REQ_INSERT            = 4,
     ZVEC_REQ_DELETE            = 5,
     ZVEC_REQ_OPTIMIZE          = 6,
+    /*
+     * ZVEC_REQ_SCAN — full-table scan via the worker (which holds the
+     * write lock).  Results are written to a tmpfile whose path is
+     * encoded in the request payload; backend reads and deletes it.
+     *
+     * Request payload: [col_name\0][max_rows: int32][dimension: int32]
+     *                  [tmpfile_path\0]
+     * Tmpfile layout:  [nrows: int32]
+     *                  [pks: nrows × char[256]]
+     *                  [vecs: nrows × dimension × float32]
+     */
+    ZVEC_REQ_SCAN              = 7,
 } ZvecRequestType;
 
 /* ----------------------------------------------------------------

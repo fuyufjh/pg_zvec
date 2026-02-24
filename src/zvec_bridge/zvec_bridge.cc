@@ -235,6 +235,97 @@ zvec_collection_search(ZvecCollectionHandle *h,
 }
 
 int
+zvec_collection_scan_all(ZvecCollectionHandle *h,
+                          int                   max_rows,
+                          int                   dimension,
+                          char                (*out_pks)[256],
+                          float                *out_vecs,
+                          char                 *errbuf,
+                          int                   errbuf_len)
+{
+    /* kMaxQueryTopk inside zvec is 1024; clamp silently */
+    if (max_rows > 1024)
+        max_rows = 1024;
+
+    /*
+     * Step 1: forward scan without include_vector_ to get PKs.
+     *
+     * include_vector_=true fails for the writing segment because its
+     * combined vector indexer is not built until Optimize().  Use
+     * include_vector_=false here (the forward store still returns all
+     * scalar fields including __pk__ and the Doc::pk()).
+     */
+    zvec::VectorQuery vq;
+    vq.topk_           = max_rows;
+    vq.field_name_     = "";    /* no vector field → forward scan */
+    vq.query_vector_   = "";    /* empty → not an ANN query */
+    vq.include_vector_ = false; /* avoid writing-segment vector indexer */
+
+    auto scan_result = h->col->Query(vq);
+    if (!scan_result)
+    {
+        snprintf(errbuf, errbuf_len, "%s", scan_result.error().message().c_str());
+        return -1;
+    }
+
+    const auto &scan_docs = *scan_result;
+    int n = static_cast<int>(scan_docs.size());
+    if (n > max_rows)
+        n = max_rows;
+
+    if (n == 0)
+        return 0;
+
+    /* Collect PKs and copy them to the output buffer */
+    std::vector<std::string> pk_list;
+    pk_list.reserve(n);
+    for (int i = 0; i < n; ++i)
+    {
+        const std::string &pk = scan_docs[i]->pk();
+        snprintf(out_pks[i], 256, "%s", pk.c_str());
+        pk_list.push_back(pk);
+    }
+
+    /*
+     * Step 2: fetch full docs (including vector data) from the forward
+     * store via Fetch().  This path reads directly from the Parquet/Arrow
+     * forward store and does not touch the vector indexer, so it works
+     * even before Optimize() has been called.
+     */
+    auto fetch_result = h->col->Fetch(pk_list);
+    if (!fetch_result)
+    {
+        snprintf(errbuf, errbuf_len, "%s", fetch_result.error().message().c_str());
+        return -1;
+    }
+
+    const auto &doc_map = *fetch_result;   /* unordered_map<string, Doc::Ptr> */
+
+    for (int i = 0; i < n; ++i)
+    {
+        float *vec_slot = out_vecs + (size_t)i * dimension;
+        auto it = doc_map.find(pk_list[i]);
+        if (it != doc_map.end() && it->second)
+        {
+            auto vec_opt = it->second->get<std::vector<float>>("embedding");
+            if (vec_opt.has_value())
+            {
+                const auto &vec = vec_opt.value();
+                int copy_len = std::min(static_cast<int>(vec.size()), dimension);
+                std::memcpy(vec_slot, vec.data(), copy_len * sizeof(float));
+                if (copy_len < dimension)
+                    std::memset(vec_slot + copy_len, 0,
+                                (dimension - copy_len) * sizeof(float));
+                continue;
+            }
+        }
+        /* pk not found in fetch result or no embedding field — zero-fill */
+        std::memset(vec_slot, 0, dimension * sizeof(float));
+    }
+    return n;
+}
+
+int
 zvec_collection_doc_count(ZvecCollectionHandle *h)
 {
     auto result = h->col->Stats();
@@ -295,6 +386,11 @@ int zvec_collection_search(ZvecCollectionHandle *, const float *, int, int,
                             const char *, ZvecSearchResult *,
                             char *errbuf, int errbuf_len)
 { stub_err(errbuf, errbuf_len, "zvec_collection_search"); return -1; }
+
+int zvec_collection_scan_all(ZvecCollectionHandle *, int, int,
+                              char (*)[256], float *,
+                              char * /*errbuf*/, int /*errbuf_len*/)
+{ return 0; /* no rows — zvec library not compiled in */ }
 
 int zvec_collection_doc_count(ZvecCollectionHandle *) { return -1; }
 

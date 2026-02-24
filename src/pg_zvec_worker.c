@@ -2,6 +2,10 @@
 #include "pg_zvec_shmem.h"
 #include "zvec_bridge/zvec_bridge.h"
 
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
@@ -434,6 +438,97 @@ process_request(void)
                 snprintf(resp.error_msg, sizeof(resp.error_msg), "%s", errbuf);
                 resp.success = false;
             }
+            break;
+        }
+
+        /* --------------------------------------------------------
+         * SCAN — full table scan; results written to a tmpfile.
+         * Payload: [name\0][max_rows: int32][dimension: int32]
+         *          [tmpfile_path\0]
+         * Tmpfile: [nrows: int32][pks: nrows×256][vecs: nrows×dim×float]
+         * -------------------------------------------------------- */
+        case ZVEC_REQ_SCAN:
+        {
+            char   col_name[ZVEC_MAX_NAME_LEN];
+            int    max_rows;
+            int    dimension;
+            char   tmpfile[ZVEC_MAX_PATH_LEN];
+            char   errbuf[256];
+            int    pos = 0;
+            WorkerCollection *wc;
+            char  (*pks)[256];
+            float *vecs;
+            int    nrows;
+            FILE  *fp;
+
+            pos = zvec_unpack_str(req.data, pos, req.data_len,
+                                  col_name, sizeof(col_name));
+            if (pos < 0) goto scan_unpack_error;
+            pos = zvec_unpack_int(req.data, pos, req.data_len, &max_rows);
+            if (pos < 0) goto scan_unpack_error;
+            pos = zvec_unpack_int(req.data, pos, req.data_len, &dimension);
+            if (pos < 0) goto scan_unpack_error;
+            pos = zvec_unpack_str(req.data, pos, req.data_len,
+                                  tmpfile, sizeof(tmpfile));
+            if (pos < 0) goto scan_unpack_error;
+
+            wc = worker_find_coll(col_name);
+            if (!wc)
+            {
+                snprintf(resp.error_msg, sizeof(resp.error_msg),
+                         "collection \"%s\" not found", col_name);
+                resp.success = false;
+                break;
+            }
+
+            if (max_rows > ZVEC_SCAN_MAX_ROWS)
+                max_rows = ZVEC_SCAN_MAX_ROWS;
+            if (max_rows <= 0 || dimension <= 0)
+            {
+                /* Write empty result file */
+                fp = fopen(tmpfile, "wb");
+                if (fp) { int z = 0; fwrite(&z, sizeof(int), 1, fp); fclose(fp); }
+                break;
+            }
+
+            pks  = (char (*)[256]) palloc(max_rows * 256);
+            vecs = (float *) palloc((size_t) max_rows * dimension * sizeof(float));
+
+            nrows = zvec_collection_scan_all(wc->handle, max_rows, dimension,
+                                              pks, vecs, errbuf, sizeof(errbuf));
+            if (nrows < 0)
+            {
+                snprintf(resp.error_msg, sizeof(resp.error_msg), "%s", errbuf);
+                resp.success = false;
+                pfree(pks);
+                pfree(vecs);
+                break;
+            }
+
+            fp = fopen(tmpfile, "wb");
+            if (!fp)
+            {
+                snprintf(resp.error_msg, sizeof(resp.error_msg),
+                         "could not create scan tmpfile \"%s\": %s",
+                         tmpfile, strerror(errno));
+                resp.success = false;
+                pfree(pks);
+                pfree(vecs);
+                break;
+            }
+            fwrite(&nrows,   sizeof(int),   1,                         fp);
+            fwrite(pks,      256,           nrows,                     fp);
+            fwrite(vecs,     sizeof(float), (size_t) nrows * dimension, fp);
+            fclose(fp);
+
+            pfree(pks);
+            pfree(vecs);
+            break;
+
+        scan_unpack_error:
+            snprintf(resp.error_msg, sizeof(resp.error_msg),
+                     "malformed SCAN payload");
+            resp.success = false;
             break;
         }
 

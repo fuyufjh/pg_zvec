@@ -119,6 +119,29 @@ int zvec_collection_search(ZvecCollectionHandle    *h,
                             int                      errbuf_len);
 
 /* ----------------------------------------------------------------
+ * Full-table scan (no vector query)
+ * ---------------------------------------------------------------- */
+
+/* Maximum rows returned by a single zvec_collection_scan_all call. */
+#define ZVEC_SCAN_MAX_ROWS 1024
+
+/*
+ * Scan all documents without a vector query (full forward scan).
+ *
+ * out_pks  must point to a char[max_rows][256] buffer.
+ * out_vecs must point to a float[max_rows * dimension] buffer.
+ *
+ * Returns the number of rows written (≤ max_rows), or -1 on error.
+ */
+int zvec_collection_scan_all(ZvecCollectionHandle *h,
+                              int                   max_rows,
+                              int                   dimension,
+                              char                (*out_pks)[256],
+                              float                *out_vecs,
+                              char                 *errbuf,
+                              int                   errbuf_len);
+
+/* ----------------------------------------------------------------
  * Metadata
  * ---------------------------------------------------------------- */
 int zvec_collection_doc_count(ZvecCollectionHandle *h);
