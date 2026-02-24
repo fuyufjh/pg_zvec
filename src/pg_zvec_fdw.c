@@ -317,8 +317,35 @@ zvec_create_collection_for_table(Oid relid)
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
         if (!attr->attisdropped && attr->atttypid == FLOAT4ARRAYOID)
         {
+            List     *col_options;
+            ListCell *lc;
+
             vec_attno = i + 1;  /* 1-based */
-            vec_type  = zvec_get_vec_type_for_column(relid, vec_attno);
+
+            /* Validate column-level options */
+            col_options = GetForeignColumnOptions(relid, vec_attno);
+            foreach(lc, col_options)
+            {
+                DefElem *def = (DefElem *) lfirst(lc);
+                if (strcmp(def->defname, "type") == 0)
+                {
+                    const char *v = defGetString(def);
+                    if (strcasecmp(v, "vector_fp32") != 0 &&
+                        strcasecmp(v, "vector_fp16") != 0)
+                        ereport(ERROR,
+                                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                                 errmsg("pg_zvec: column option \"type\" must be vector_fp32 or vector_fp16")));
+                    if (strcasecmp(v, "vector_fp16") == 0)
+                        vec_type = ZVEC_VEC_FP16;
+                }
+                else
+                {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                             errmsg("pg_zvec: unrecognised column option \"%s\"",
+                                    def->defname)));
+                }
+            }
             break;
         }
     }
@@ -442,6 +469,61 @@ pg_zvec_process_utility(PlannedStmt *pstmt,
                          QueryCompletion *qc)
 {
     Node *parsetree = pstmt->utilityStmt;
+
+    /* ----------------------------------------------------------------
+     * CREATE FOREIGN TABLE: validate column options BEFORE creation
+     * ---------------------------------------------------------------- */
+    if (IsA(parsetree, CreateForeignTableStmt))
+    {
+        CreateForeignTableStmt *cfts = (CreateForeignTableStmt *) parsetree;
+        ForeignServer          *server = NULL;
+        ForeignDataWrapper     *fdw    = NULL;
+        ListCell               *lc;
+
+        /* Check if this is a zvec_fdw table */
+        if (cfts->servername)
+        {
+            server = GetForeignServerByName(cfts->servername, true);
+            if (server)
+            {
+                fdw = GetForeignDataWrapper(server->fdwid);
+                if (fdw && strcmp(fdw->fdwname, "zvec_fdw") == 0)
+                {
+                    /* Validate column-level options for zvec tables */
+                    foreach(lc, cfts->base.tableElts)
+                    {
+                        Node *node = (Node *) lfirst(lc);
+                        if (IsA(node, ColumnDef))
+                        {
+                            ColumnDef *colDef = (ColumnDef *) node;
+                            ListCell  *opt_lc;
+
+                            foreach(opt_lc, colDef->fdwoptions)
+                            {
+                                DefElem *def = (DefElem *) lfirst(opt_lc);
+                                if (strcmp(def->defname, "type") == 0)
+                                {
+                                    const char *v = defGetString(def);
+                                    if (strcasecmp(v, "vector_fp32") != 0 &&
+                                        strcasecmp(v, "vector_fp16") != 0)
+                                        ereport(ERROR,
+                                                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                                                 errmsg("pg_zvec: column option \"type\" must be vector_fp32 or vector_fp16")));
+                                }
+                                else
+                                {
+                                    ereport(ERROR,
+                                            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                                             errmsg("pg_zvec: unrecognised column option \"%s\"",
+                                                    def->defname)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /* ----------------------------------------------------------------
      * DROP FOREIGN TABLE: collect collection names BEFORE the drop so
