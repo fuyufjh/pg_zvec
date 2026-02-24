@@ -7,7 +7,7 @@
 #
 # Variables you can override on the command line:
 #   PG_CONFIG  – path to pg_config          (default: first on $PATH)
-#   USE_ZVEC   – set to 1 to compile with the real zvec library
+#   USE_ZVEC   – set to 0 to disable zvec library (default: 1, enabled)
 #   ZVEC_BUILD – path to the zvec cmake build directory
 ##############################################################################
 
@@ -33,7 +33,11 @@ PG_CPPFLAGS = -I$(CURDIR)/src
 # ---- Linker flags -----------------------------------------------------------
 SHLIB_LINK += -lstdc++
 
+# Enable USE_ZVEC by default (set to 0 to disable)
+USE_ZVEC ?= 1
+
 ifdef USE_ZVEC
+ifneq ($(USE_ZVEC),0)
 ZVEC_BUILD  ?= $(CURDIR)/zvec/build
 ZVEC_EXT    := $(ZVEC_BUILD)/external/usr/local/lib
 ZVEC_LIB    := $(ZVEC_BUILD)/lib
@@ -60,6 +64,7 @@ SHLIB_LINK += \
 	$(ZVEC_EXT)/libgflags_nothreads.a \
 	$(ZVEC_ARROW)/zlib_ep/src/zlib_ep-install/lib/libz.a \
 	-lpthread -ldl
+endif
 endif
 
 # ---- Regression tests -------------------------------------------------------
@@ -90,10 +95,12 @@ ZVEC_CXXFLAGS = \
 	-I$(PG_INCLUDEDIR)
 
 ifdef USE_ZVEC
+ifneq ($(USE_ZVEC),0)
 ZVEC_CXXFLAGS += \
 	-DUSE_ZVEC \
 	-I$(CURDIR)/zvec/src/include \
 	-I$(ZVEC_BUILD)/external/usr/local/include
+endif
 endif
 
 $(CXX_OBJ): src/zvec_bridge/zvec_bridge.cc src/zvec_bridge/zvec_bridge.h
