@@ -296,6 +296,7 @@ zvec_create_collection_for_table(Oid relid)
     int            pos = 0;
     int            vec_attno = -1;
     int            vec_type  = ZVEC_VEC_FP32;
+    Relation       rel;
     TupleDesc      tupdesc;
     int            i;
 
@@ -311,7 +312,8 @@ zvec_create_collection_for_table(Oid relid)
                  errmsg("pg_zvec: foreign table must specify a positive \"dimension\" option")));
 
     /* Locate first float4[] column to read its vec_type option */
-    tupdesc = RelationGetDescr(RelationIdGetRelation(relid));
+    rel = RelationIdGetRelation(relid);
+    tupdesc = RelationGetDescr(rel);
     for (i = 0; i < tupdesc->natts; i++)
     {
         Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
@@ -349,6 +351,7 @@ zvec_create_collection_for_table(Oid relid)
             break;
         }
     }
+    RelationClose(rel);
 
     /* Collection name = relation name (schema-unqualified) */
     strlcpy(col_name, get_rel_name(relid), sizeof(col_name));

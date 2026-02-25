@@ -26,7 +26,6 @@ CREATE FOREIGN TABLE t_all_types (
     vec_fp32   float4[],
     vec_fp16   float4[] OPTIONS (type 'vector_fp16')
 ) SERVER zvec_server OPTIONS (dimension '4');
-WARNING:  relcache reference leak: relation "t_all_types" not closed
 -- INSERT rows covering every scalar type
 INSERT INTO t_all_types VALUES (
     'row1', 'hello world', true,
