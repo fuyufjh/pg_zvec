@@ -1,5 +1,7 @@
 # pg_zvec
 
+> 🚧 项目还处于早期开发阶段，请勿用于生产 🚧
+
 基于 [zvec](https://github.com/alibaba/zvec) 的 PostgreSQL 高性能向量相似度搜索扩展。
 
 pg_zvec 是一个 PostgreSQL 外部数据包装器 (FDW) 扩展，将 zvec 向量数据库引擎直接集成到 PostgreSQL 中。它支持使用标准 SQL 语法进行近似最近邻 (ANN) 搜索，非常适合需要低延迟向量检索与关系数据协同工作的 AI/ML 场景。

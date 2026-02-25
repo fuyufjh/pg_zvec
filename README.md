@@ -1,5 +1,7 @@
 # pg_zvec
 
+> 🚧 This project is still in early development — Do NOT use it in production. 🚧
+
 High-performance vector similarity search for PostgreSQL, powered by [zvec](https://github.com/alibaba/zvec).
 
 pg_zvec is a PostgreSQL Foreign Data Wrapper (FDW) extension that integrates the zvec vector database engine directly into PostgreSQL. It enables approximate nearest neighbor (ANN) search using familiar SQL syntax, making it ideal for AI/ML workloads that need low-latency vector retrieval alongside relational data.
