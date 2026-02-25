@@ -34,5 +34,6 @@ pg_zvec_shmem_startup(void)
          */
         MemSet(pg_zvec_state, 0, sizeof(PgZvecSharedState));
         pg_zvec_state->lock = &GetNamedLWLockTranche("pg_zvec")[0].lock;
+        pg_atomic_init_u32(&pg_zvec_state->session_version, 0);
     }
 }

@@ -3,11 +3,9 @@
  *
  * Foreign Data Wrapper for zvec vector collections.
  *
- * Phase 1 scope:
- *   - Register FDW handler / validator
- *   - CREATE FOREIGN TABLE  → create zvec Collection via worker IPC
- *   - DROP   FOREIGN TABLE  → destroy zvec Collection via worker IPC
- *   - Stub scan / modify callbacks (return errors; replaced in Phase 2-3)
+ * IPC with the background worker uses per-backend shm_mq pairs via
+ * dynamic shared memory (DSM).  Each backend lazily creates a DSM
+ * segment with req_mq (backend→worker) and resp_mq (worker→backend).
  */
 
 #include "pg_zvec_fdw.h"
@@ -38,11 +36,13 @@
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "postmaster/bgworker.h"
+#include "storage/dsm.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/shm_mq.h"
 #include "storage/shmem.h"
 #include "tcop/utility.h"
 #include "utils/array.h"
@@ -217,13 +217,55 @@ zvec_table_options(ForeignTable *ft, ForeignServer *server,
 }
 
 /* ----------------------------------------------------------------
- * IPC: send a request to the background worker and wait for response
+ * Per-backend shm_mq session state (process-local)
+ *
+ * Lazily created on first IPC call; torn down on backend exit.
  * ---------------------------------------------------------------- */
-static bool
-send_worker_request(ZvecRequest *req, ZvecResponse *resp,
-                    int timeout_ms, char *errbuf, int errbuf_len)
+static dsm_segment    *my_dsm_seg    = NULL;
+static shm_mq_handle  *my_req_mqh    = NULL;
+static shm_mq_handle  *my_resp_mqh   = NULL;
+static int             my_session_idx = -1;
+static bool            session_cleanup_registered = false;
+
+static void
+cleanup_session(int code, Datum arg)
 {
-    int waited = 0;
+    if (my_req_mqh)
+    {
+        shm_mq_detach(my_req_mqh);
+        my_req_mqh = NULL;
+    }
+    if (my_resp_mqh)
+    {
+        shm_mq_detach(my_resp_mqh);
+        my_resp_mqh = NULL;
+    }
+    if (my_dsm_seg)
+    {
+        dsm_detach(my_dsm_seg);
+        my_dsm_seg = NULL;
+    }
+    if (pg_zvec_state && my_session_idx >= 0)
+    {
+        LWLockAcquire(pg_zvec_state->lock, LW_EXCLUSIVE);
+        pg_zvec_state->sessions[my_session_idx].in_use = false;
+        pg_zvec_state->sessions[my_session_idx].backend_pid = 0;
+        pg_atomic_fetch_add_u32(&pg_zvec_state->session_version, 1);
+        LWLockRelease(pg_zvec_state->lock);
+        my_session_idx = -1;
+    }
+}
+
+static bool
+ensure_session(char *errbuf, int errbuf_len)
+{
+    char    *base;
+    shm_mq  *req_mq;
+    shm_mq  *resp_mq;
+    int      i;
+
+    if (my_dsm_seg != NULL)
+        return true;    /* already established */
 
     if (!pg_zvec_state)
     {
@@ -231,68 +273,160 @@ send_worker_request(ZvecRequest *req, ZvecResponse *resp,
         return false;
     }
 
-    LWLockAcquire(pg_zvec_state->lock, LW_EXCLUSIVE);
-
+    LWLockAcquire(pg_zvec_state->lock, LW_SHARED);
     if (!pg_zvec_state->worker_ready)
     {
         LWLockRelease(pg_zvec_state->lock);
         snprintf(errbuf, errbuf_len, "pg_zvec worker is not running");
         return false;
     }
+    LWLockRelease(pg_zvec_state->lock);
 
-    if (pg_zvec_state->request_pending)
+    /* 1. Create DSM segment with room for two shm_mq queues */
+    my_dsm_seg = dsm_create(ZVEC_REQ_QUEUE_SIZE + ZVEC_RESP_QUEUE_SIZE, 0);
+    if (!my_dsm_seg)
     {
-        LWLockRelease(pg_zvec_state->lock);
-        snprintf(errbuf, errbuf_len, "pg_zvec worker is busy; try again later");
+        snprintf(errbuf, errbuf_len, "could not create DSM segment for pg_zvec session");
+        return false;
+    }
+    dsm_pin_mapping(my_dsm_seg);
+
+    base = (char *) dsm_segment_address(my_dsm_seg);
+
+    /* 2. Create the two shm_mq queues inside the DSM */
+    req_mq  = shm_mq_create(base, ZVEC_REQ_QUEUE_SIZE);
+    resp_mq = shm_mq_create(base + ZVEC_REQ_QUEUE_SIZE, ZVEC_RESP_QUEUE_SIZE);
+
+    /* Backend is sender on req_mq, receiver on resp_mq */
+    shm_mq_set_sender(req_mq,  MyProc);
+    shm_mq_set_receiver(resp_mq, MyProc);
+
+    {
+        MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
+        my_req_mqh  = shm_mq_attach(req_mq,  my_dsm_seg, NULL);
+        my_resp_mqh = shm_mq_attach(resp_mq, my_dsm_seg, NULL);
+        MemoryContextSwitchTo(oldctx);
+    }
+
+    /* 3. Register in the session directory */
+    LWLockAcquire(pg_zvec_state->lock, LW_EXCLUSIVE);
+    my_session_idx = -1;
+    for (i = 0; i < ZVEC_MAX_SESSIONS; i++)
+    {
+        if (!pg_zvec_state->sessions[i].in_use)
+        {
+            pg_zvec_state->sessions[i].in_use      = true;
+            pg_zvec_state->sessions[i].backend_pid  = MyProcPid;
+            pg_zvec_state->sessions[i].handle       = dsm_segment_handle(my_dsm_seg);
+            my_session_idx = i;
+            pg_atomic_fetch_add_u32(&pg_zvec_state->session_version, 1);
+            break;
+        }
+    }
+    LWLockRelease(pg_zvec_state->lock);
+
+    if (my_session_idx < 0)
+    {
+        shm_mq_detach(my_req_mqh);  my_req_mqh  = NULL;
+        shm_mq_detach(my_resp_mqh); my_resp_mqh = NULL;
+        dsm_detach(my_dsm_seg);     my_dsm_seg  = NULL;
+        snprintf(errbuf, errbuf_len, "pg_zvec: session directory full (%d sessions)",
+                 ZVEC_MAX_SESSIONS);
         return false;
     }
 
-    req->sender_pid = MyProcPid;
-    memcpy(&pg_zvec_state->request, req, sizeof(ZvecRequest));
-    pg_zvec_state->request_pending = true;
-    pg_zvec_state->response_ready  = false;
-
-    if (pg_zvec_state->worker_pid > 0)
+    /* 4. Wake worker so it discovers the new session */
     {
-        PGPROC *worker = BackendPidGetProc(pg_zvec_state->worker_pid);
+        PGPROC *worker;
+        LWLockAcquire(pg_zvec_state->lock, LW_SHARED);
+        worker = BackendPidGetProc(pg_zvec_state->worker_pid);
         if (worker)
             SetLatch(&worker->procLatch);
-    }
-
-    LWLockRelease(pg_zvec_state->lock);
-
-    while (waited < timeout_ms)
-    {
-        int rc;
-
-        rc = WaitLatch(MyLatch,
-                       WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-                       1L,
-                       PG_WAIT_EXTENSION);
-        ResetLatch(MyLatch);
-
-        if (rc & WL_EXIT_ON_PM_DEATH)
-        {
-            snprintf(errbuf, errbuf_len, "postmaster died");
-            return false;
-        }
-
-        LWLockAcquire(pg_zvec_state->lock, LW_SHARED);
-        if (pg_zvec_state->response_ready)
-        {
-            memcpy(resp, &pg_zvec_state->response, sizeof(ZvecResponse));
-            LWLockRelease(pg_zvec_state->lock);
-            if (!resp->success)
-                snprintf(errbuf, errbuf_len, "%s", resp->error_msg);
-            return resp->success;
-        }
         LWLockRelease(pg_zvec_state->lock);
-
-        waited += 1;
     }
 
-    snprintf(errbuf, errbuf_len, "timed out waiting for pg_zvec worker");
-    return false;
+    /* 5. Register cleanup so the session is torn down on backend exit */
+    if (!session_cleanup_registered)
+    {
+        before_shmem_exit(cleanup_session, (Datum) 0);
+        session_cleanup_registered = true;
+    }
+
+    return true;
+}
+
+/* ----------------------------------------------------------------
+ * IPC: send a request to the background worker and wait for response.
+ *
+ * The caller packs a payload into buf/buf_len.  We prepend ZvecMsgHeader,
+ * send via req_mq, and block on resp_mq.  The response header + payload
+ * are returned in *resp_hdr; *resp_data points into shm_mq memory and
+ * is only valid until the next send/receive on the same queue.
+ * ---------------------------------------------------------------- */
+static bool
+send_worker_request(ZvecRequestType type, Oid dbid,
+                    const char *payload, int payload_len,
+                    ZvecRespHeader *resp_hdr,
+                    const char **resp_data,
+                    char *errbuf, int errbuf_len)
+{
+    ZvecMsgHeader   hdr;
+    shm_mq_iovec    iov[2];
+    shm_mq_result   res;
+    Size            nbytes;
+    void           *data;
+
+    if (!ensure_session(errbuf, errbuf_len))
+        return false;
+
+    /* Build and send request */
+    hdr.type        = type;
+    hdr.database_id = dbid;
+    hdr.data_len    = payload_len;
+
+    iov[0].data = (const char *) &hdr;
+    iov[0].len  = sizeof(ZvecMsgHeader);
+    iov[1].data = payload;
+    iov[1].len  = payload_len;
+
+    res = shm_mq_sendv(my_req_mqh, iov, (payload_len > 0) ? 2 : 1,
+                        false, true);
+    if (res != SHM_MQ_SUCCESS)
+    {
+        snprintf(errbuf, errbuf_len,
+                 "pg_zvec: failed to send request (shm_mq result %d)", (int) res);
+        return false;
+    }
+
+    /* Wait for response (blocks via latch, no polling) */
+    res = shm_mq_receive(my_resp_mqh, &nbytes, &data, false);
+    if (res != SHM_MQ_SUCCESS)
+    {
+        snprintf(errbuf, errbuf_len,
+                 "pg_zvec: failed to receive response (shm_mq result %d)", (int) res);
+        return false;
+    }
+
+    if (nbytes < sizeof(ZvecRespHeader))
+    {
+        snprintf(errbuf, errbuf_len, "pg_zvec: truncated response");
+        return false;
+    }
+
+    memcpy(resp_hdr, data, sizeof(ZvecRespHeader));
+    *resp_data = (const char *) data + sizeof(ZvecRespHeader);
+
+    if (!resp_hdr->success && resp_hdr->data_len > 0)
+    {
+        /* Error message is in the payload */
+        int copylen = resp_hdr->data_len;
+        if (copylen >= errbuf_len)
+            copylen = errbuf_len - 1;
+        memcpy(errbuf, *resp_data, copylen);
+        errbuf[copylen] = '\0';
+    }
+
+    return resp_hdr->success;
 }
 
 /* ----------------------------------------------------------------
@@ -312,9 +446,11 @@ zvec_create_collection_for_table(Oid relid)
     char           col_path[ZVEC_MAX_PATH_LEN];
     char           col_name[ZVEC_MAX_NAME_LEN];
     char           errbuf[256];
-    ZvecRequest    req;
-    ZvecResponse   resp;
+    char           buf[4096];
+    ZvecRespHeader resp_hdr;
+    const char    *resp_data;
     int            pos = 0;
+    int            bufsz = sizeof(buf);
     int            vec_attno = -1;
     int            vec_type  = ZVEC_VEC_FP32;
     Relation       rel;
@@ -397,37 +533,34 @@ zvec_create_collection_for_table(Oid relid)
     /* Full path = data_dir / col_name */
     snprintf(col_path, sizeof(col_path), "%s/%s", data_dir, col_name);
 
-    memset(&req, 0, sizeof(req));
-    req.type        = ZVEC_REQ_CREATE_COLLECTION;
-    req.database_id = MyDatabaseId;
-
-    pos = zvec_pack_str(req.data, pos, sizeof(req.data), col_name);
+    pos = zvec_pack_str(buf, pos, bufsz, col_name);
     if (pos < 0) goto overflow;
-    pos = zvec_pack_str(req.data, pos, sizeof(req.data), col_path);
+    pos = zvec_pack_str(buf, pos, bufsz, col_path);
     if (pos < 0) goto overflow;
-    pos = zvec_pack_str(req.data, pos, sizeof(req.data), index_type);
+    pos = zvec_pack_str(buf, pos, bufsz, index_type);
     if (pos < 0) goto overflow;
-    pos = zvec_pack_str(req.data, pos, sizeof(req.data), metric);
+    pos = zvec_pack_str(buf, pos, bufsz, metric);
     if (pos < 0) goto overflow;
-    pos = zvec_pack_int(req.data, pos, sizeof(req.data), dimension);
+    pos = zvec_pack_int(buf, pos, bufsz, dimension);
     if (pos < 0) goto overflow;
-    pos = zvec_pack_str(req.data, pos, sizeof(req.data),
+    pos = zvec_pack_str(buf, pos, bufsz,
                         (vec_type == ZVEC_VEC_FP16) ? "vector_fp16" : "vector_fp32");
     if (pos < 0) goto overflow;
-    pos = zvec_pack_str(req.data, pos, sizeof(req.data), params_json);
+    pos = zvec_pack_str(buf, pos, bufsz, params_json);
     if (pos < 0) goto overflow;
 
     /* Pack scalar field names */
-    pos = zvec_pack_int(req.data, pos, sizeof(req.data), n_scalar_fields);
+    pos = zvec_pack_int(buf, pos, bufsz, n_scalar_fields);
     if (pos < 0) goto overflow;
     for (i = 0; i < n_scalar_fields; i++)
     {
-        pos = zvec_pack_str(req.data, pos, sizeof(req.data), scalar_field_names[i]);
+        pos = zvec_pack_str(buf, pos, bufsz, scalar_field_names[i]);
         if (pos < 0) goto overflow;
     }
-    req.data_len = pos;
 
-    if (!send_worker_request(&req, &resp, 10000, errbuf, sizeof(errbuf)))
+    if (!send_worker_request(ZVEC_REQ_CREATE_COLLECTION, MyDatabaseId,
+                             buf, pos, &resp_hdr, &resp_data,
+                             errbuf, sizeof(errbuf)))
         ereport(WARNING,
                 (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                  errmsg("pg_zvec: failed to create collection \"%s\": %s",
@@ -445,12 +578,13 @@ overflow:
 static void
 zvec_drop_collection_for_table(Oid relid)
 {
-    char          col_name[ZVEC_MAX_NAME_LEN];
-    char          errbuf[256];
-    ZvecRequest   req;
-    ZvecResponse  resp;
-    int           pos = 0;
-    char         *rel_name;
+    char           col_name[ZVEC_MAX_NAME_LEN];
+    char           errbuf[256];
+    char           buf[ZVEC_MAX_NAME_LEN];
+    ZvecRespHeader resp_hdr;
+    const char    *resp_data;
+    int            pos = 0;
+    char          *rel_name;
 
     rel_name = get_rel_name(relid);
     if (!rel_name)
@@ -458,20 +592,17 @@ zvec_drop_collection_for_table(Oid relid)
 
     strlcpy(col_name, rel_name, sizeof(col_name));
 
-    memset(&req, 0, sizeof(req));
-    req.type        = ZVEC_REQ_DROP_COLLECTION;
-    req.database_id = MyDatabaseId;
-
-    pos = zvec_pack_str(req.data, pos, sizeof(req.data), col_name);
+    pos = zvec_pack_str(buf, pos, sizeof(buf), col_name);
     if (pos < 0)
     {
         ereport(WARNING,
                 (errmsg("pg_zvec: IPC buffer overflow building DROP request")));
         return;
     }
-    req.data_len = pos;
 
-    if (!send_worker_request(&req, &resp, 10000, errbuf, sizeof(errbuf)))
+    if (!send_worker_request(ZVEC_REQ_DROP_COLLECTION, MyDatabaseId,
+                             buf, pos, &resp_hdr, &resp_data,
+                             errbuf, sizeof(errbuf)))
         ereport(WARNING,
                 (errmsg("pg_zvec: failed to drop collection \"%s\": %s",
                         col_name, errbuf)));
@@ -768,54 +899,46 @@ zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
     }
 
     /* ----------------------------------------------------------------
-     * Route the scan through the background worker.
+     * Route the scan through the background worker via shm_mq.
      *
      * zvec uses an exclusive file lock for write handles.  The worker
      * owns the write handle, so we cannot open a read-only handle
-     * concurrently.  Instead we send ZVEC_REQ_SCAN; the worker calls
-     * zvec_collection_scan_all() and writes the results to a tmpfile.
+     * concurrently.  We send ZVEC_REQ_SCAN; the worker scans and
+     * returns the results inline in the resp_mq payload.
      * ---------------------------------------------------------------- */
     strlcpy(col_name, RelationGetRelationName(rel), sizeof(col_name));
 
     {
-        ZvecRequest  req;
-        ZvecResponse resp;
-        char         tmpfile[ZVEC_MAX_PATH_LEN];
-        int          max_rows = ZVEC_SCAN_MAX_ROWS;
-        int          pos = 0;
-        FILE        *fp;
-        int          nrows = 0;
-        int          file_n_scalar = 0;
-        char       (*pks)[256] = NULL;
-        float       *vecs = NULL;
+        char           buf[4096];
+        int            bufsz = sizeof(buf);
+        ZvecRespHeader resp_hdr;
+        const char    *resp_data;
+        int            max_rows = ZVEC_SCAN_MAX_ROWS;
+        int            pos = 0;
+        int            nrows = 0;
+        int            file_n_scalar = 0;
+        char         (*pks)[256] = NULL;
+        float         *vecs = NULL;
 
-        snprintf(tmpfile, sizeof(tmpfile),
-                 "/tmp/pg_zvec_scan_%d.bin", MyProcPid);
-
-        memset(&req, 0, sizeof(req));
-        req.type        = ZVEC_REQ_SCAN;
-        req.database_id = MyDatabaseId;
-
-        pos = zvec_pack_str(req.data, pos, sizeof(req.data), col_name);
+        pos = zvec_pack_str(buf, pos, bufsz, col_name);
         if (pos < 0) goto overflow;
-        pos = zvec_pack_int(req.data, pos, sizeof(req.data), max_rows);
+        pos = zvec_pack_int(buf, pos, bufsz, max_rows);
         if (pos < 0) goto overflow;
-        pos = zvec_pack_int(req.data, pos, sizeof(req.data), dimension);
-        if (pos < 0) goto overflow;
-        pos = zvec_pack_str(req.data, pos, sizeof(req.data), tmpfile);
+        pos = zvec_pack_int(buf, pos, bufsz, dimension);
         if (pos < 0) goto overflow;
 
         /* Pack scalar field names for the worker to fetch */
-        pos = zvec_pack_int(req.data, pos, sizeof(req.data), state->n_scalar_fields);
+        pos = zvec_pack_int(buf, pos, bufsz, state->n_scalar_fields);
         if (pos < 0) goto overflow;
         for (i = 0; i < state->n_scalar_fields; i++)
         {
-            pos = zvec_pack_str(req.data, pos, sizeof(req.data), state->scalar_names[i]);
+            pos = zvec_pack_str(buf, pos, bufsz, state->scalar_names[i]);
             if (pos < 0) goto overflow;
         }
-        req.data_len = pos;
 
-        if (!send_worker_request(&req, &resp, 30000, errbuf, sizeof(errbuf)))
+        if (!send_worker_request(ZVEC_REQ_SCAN, MyDatabaseId,
+                                 buf, pos, &resp_hdr, &resp_data,
+                                 errbuf, sizeof(errbuf)))
         {
             ereport(WARNING,
                     (errmsg("pg_zvec: scan request failed for \"%s\": %s",
@@ -825,60 +948,60 @@ zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
             return;
         }
 
-        /* Read results from tmpfile */
-        fp = fopen(tmpfile, "rb");
-        if (fp)
+        /* Parse scan results from resp_mq payload */
+        if (resp_hdr.data_len >= (int)(sizeof(int) * 2))
         {
-            if (fread(&nrows, sizeof(int), 1, fp) == 1 &&
-                fread(&file_n_scalar, sizeof(int), 1, fp) == 1 &&
-                nrows > 0)
+            int rpos = 0;
+            int data_len = resp_hdr.data_len;
+
+            rpos = zvec_unpack_int(resp_data, rpos, data_len, &nrows);
+            if (rpos < 0) nrows = 0;
+            rpos = zvec_unpack_int(resp_data, rpos, data_len, &file_n_scalar);
+            if (rpos < 0) file_n_scalar = 0;
+
+            if (nrows > 0)
             {
-                pks  = (char (*)[256]) palloc(nrows * 256);
-                vecs = (float *) palloc((Size)((int64) nrows * dimension
-                                               * (int64) sizeof(float)));
-                if (fread(pks, 256, nrows, fp) != (size_t) nrows ||
-                    fread(vecs, sizeof(float) * dimension, nrows, fp) != (size_t) nrows)
+                Size pk_size  = (Size) nrows * 256;
+                Size vec_size = (Size) nrows * dimension * sizeof(float);
+
+                if (rpos + (int)(pk_size + vec_size) <= data_len)
                 {
-                    /* Partial read — treat as empty */
-                    pfree(pks);
-                    pfree(vecs);
-                    pks   = NULL;
-                    vecs  = NULL;
-                    nrows = 0;
-                }
-                else if (file_n_scalar > 0 && nrows > 0)
-                {
+                    pks  = (char (*)[256]) palloc(pk_size);
+                    vecs = (float *) palloc(vec_size);
+                    memcpy(pks,  resp_data + rpos, pk_size);
+                    rpos += (int) pk_size;
+                    memcpy(vecs, resp_data + rpos, vec_size);
+                    rpos += (int) vec_size;
+
                     /* Read scalar values section */
-                    int total = nrows * file_n_scalar;
-                    int si;
-                    state->scalar_vals = (char **) palloc0(total * sizeof(char *));
-                    for (si = 0; si < total; si++)
+                    if (file_n_scalar > 0)
                     {
-                        uint8 has_val = 0;
-                        if (fread(&has_val, 1, 1, fp) != 1)
-                            break;
-                        if (has_val)
+                        int total = nrows * file_n_scalar;
+                        int si;
+                        state->scalar_vals = (char **) palloc0(total * sizeof(char *));
+                        for (si = 0; si < total && rpos < data_len; si++)
                         {
-                            /* Read null-terminated string */
-                            char buf[4096];
-                            int ch, bi = 0;
-                            while ((ch = fgetc(fp)) != EOF && ch != '\0' && bi < (int)sizeof(buf) - 1)
-                                buf[bi++] = (char) ch;
-                            buf[bi] = '\0';
-                            state->scalar_vals[si] = pstrdup(buf);
+                            uint8 has_val = (uint8) resp_data[rpos++];
+                            if (has_val && rpos < data_len)
+                            {
+                                /* Read null-terminated string */
+                                const char *sval = resp_data + rpos;
+                                int slen = 0;
+                                while (rpos + slen < data_len && sval[slen] != '\0')
+                                    slen++;
+                                state->scalar_vals[si] = pnstrdup(sval, slen);
+                                rpos += slen + 1;  /* skip past '\0' */
+                            }
+                            /* else: scalar_vals[si] stays NULL */
                         }
-                        /* else: scalar_vals[si] stays NULL */
                     }
                 }
+                else
+                {
+                    /* Truncated payload */
+                    nrows = 0;
+                }
             }
-            fclose(fp);
-            unlink(tmpfile);
-        }
-        else
-        {
-            ereport(WARNING,
-                    (errmsg("pg_zvec: could not open scan results for \"%s\"",
-                            col_name)));
         }
 
         state->nrows = nrows;
@@ -1167,8 +1290,10 @@ zvec_exec_foreign_insert(EState *estate,
                           TupleTableSlot *planSlot)
 {
     ZvecFdwModifyState *mstate = (ZvecFdwModifyState *) rinfo->ri_FdwState;
-    ZvecRequest         req;
-    ZvecResponse        resp;
+    char                buf[8192];
+    int                 bufsz = sizeof(buf);
+    ZvecRespHeader      resp_hdr;
+    const char         *resp_data;
     char                errbuf[256];
     int                 pos = 0;
     bool                isnull;
@@ -1216,21 +1341,17 @@ zvec_exec_foreign_insert(EState *estate,
      * [name\0][pk\0][vec_len:int32][float32*vec_len]
      * [n_scalars:int32][field_name\0 is_null:int32 value\0]...
      */
-    memset(&req, 0, sizeof(req));
-    req.type        = ZVEC_REQ_INSERT;
-    req.database_id = MyDatabaseId;
-
-    pos = zvec_pack_str(req.data, pos, sizeof(req.data), mstate->collection_name);
+    pos = zvec_pack_str(buf, pos, bufsz, mstate->collection_name);
     if (pos < 0) goto overflow;
-    pos = zvec_pack_str(req.data, pos, sizeof(req.data), pk_str);
+    pos = zvec_pack_str(buf, pos, bufsz, pk_str);
     if (pos < 0) goto overflow;
-    pos = zvec_pack_int(req.data, pos, sizeof(req.data), vec_len);
+    pos = zvec_pack_int(buf, pos, bufsz, vec_len);
     if (pos < 0) goto overflow;
-    pos = zvec_pack_floats(req.data, pos, sizeof(req.data), vec, vec_len);
+    pos = zvec_pack_floats(buf, pos, bufsz, vec, vec_len);
     if (pos < 0) goto overflow;
 
     /* Pack scalar field values */
-    pos = zvec_pack_int(req.data, pos, sizeof(req.data), mstate->n_scalar_fields);
+    pos = zvec_pack_int(buf, pos, bufsz, mstate->n_scalar_fields);
     if (pos < 0) goto overflow;
     {
         int si;
@@ -1240,26 +1361,27 @@ zvec_exec_foreign_insert(EState *estate,
             bool   sn;
             int    is_null_int;
 
-            pos = zvec_pack_str(req.data, pos, sizeof(req.data), mstate->scalar_names[si]);
+            pos = zvec_pack_str(buf, pos, bufsz, mstate->scalar_names[si]);
             if (pos < 0) goto overflow;
 
             sd = slot_getattr(slot, mstate->scalar_attno[si], &sn);
             is_null_int = sn ? 1 : 0;
-            pos = zvec_pack_int(req.data, pos, sizeof(req.data), is_null_int);
+            pos = zvec_pack_int(buf, pos, bufsz, is_null_int);
             if (pos < 0) goto overflow;
 
             if (!sn)
             {
                 char *val_str = OidOutputFunctionCall(mstate->scalar_typoutput[si], sd);
-                pos = zvec_pack_str(req.data, pos, sizeof(req.data), val_str);
+                pos = zvec_pack_str(buf, pos, bufsz, val_str);
                 if (pos < 0) goto overflow;
                 pfree(val_str);
             }
         }
     }
-    req.data_len = pos;
 
-    if (!send_worker_request(&req, &resp, 10000, errbuf, sizeof(errbuf)))
+    if (!send_worker_request(ZVEC_REQ_INSERT, MyDatabaseId,
+                             buf, pos, &resp_hdr, &resp_data,
+                             errbuf, sizeof(errbuf)))
         ereport(ERROR,
                 (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                  errmsg("pg_zvec: INSERT failed: %s", errbuf)));
@@ -1286,8 +1408,10 @@ zvec_exec_foreign_delete(EState *estate,
                           TupleTableSlot *planSlot)
 {
     ZvecFdwModifyState *mstate = (ZvecFdwModifyState *) rinfo->ri_FdwState;
-    ZvecRequest         req;
-    ZvecResponse        resp;
+    char                buf[512];
+    int                 bufsz = sizeof(buf);
+    ZvecRespHeader      resp_hdr;
+    const char         *resp_data;
     char                errbuf[256];
     int                 pos = 0;
     bool                isnull;
@@ -1303,17 +1427,14 @@ zvec_exec_foreign_delete(EState *estate,
     pk_str = OidOutputFunctionCall(mstate->pk_typoutput, pk_datum);
 
     /* Build IPC payload: [name\0][pk\0] */
-    memset(&req, 0, sizeof(req));
-    req.type        = ZVEC_REQ_DELETE;
-    req.database_id = MyDatabaseId;
-
-    pos = zvec_pack_str(req.data, pos, sizeof(req.data), mstate->collection_name);
+    pos = zvec_pack_str(buf, pos, bufsz, mstate->collection_name);
     if (pos < 0) goto overflow;
-    pos = zvec_pack_str(req.data, pos, sizeof(req.data), pk_str);
+    pos = zvec_pack_str(buf, pos, bufsz, pk_str);
     if (pos < 0) goto overflow;
-    req.data_len = pos;
 
-    if (!send_worker_request(&req, &resp, 10000, errbuf, sizeof(errbuf)))
+    if (!send_worker_request(ZVEC_REQ_DELETE, MyDatabaseId,
+                             buf, pos, &resp_hdr, &resp_data,
+                             errbuf, sizeof(errbuf)))
         ereport(ERROR,
                 (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                  errmsg("pg_zvec: DELETE failed: %s", errbuf)));

@@ -2,6 +2,8 @@
 #define PG_ZVEC_SHMEM_H
 
 #include "postgres.h"
+#include "port/atomics.h"
+#include "storage/dsm_impl.h"
 #include "storage/lwlock.h"
 #include <string.h>
 
@@ -12,12 +14,17 @@
 #define ZVEC_MAX_NAME_LEN       128
 #define ZVEC_MAX_PATH_LEN       512
 #define ZVEC_MAX_PARAMS_LEN     1024
-/*
- * 20 KB request payload: supports vectors up to ~5000 float32 dimensions
- * plus collection name, pk, and metadata.
- */
-#define ZVEC_MAX_REQUEST_DATA   20480
-#define ZVEC_MAX_RESPONSE_DATA  256     /* error message buffer           */
+
+/* ----------------------------------------------------------------
+ * Per-backend shm_mq session limits and DSM sizes
+ *
+ * Each backend that talks to the worker creates a DSM segment
+ * containing two shm_mq queues (request + response).  The session
+ * directory in PgZvecSharedState tracks active DSM handles.
+ * ---------------------------------------------------------------- */
+#define ZVEC_MAX_SESSIONS       64
+#define ZVEC_REQ_QUEUE_SIZE     (64 * 1024)         /* 64 KB  */
+#define ZVEC_RESP_QUEUE_SIZE    (4 * 1024 * 1024)   /* 4 MB   */
 
 /* ----------------------------------------------------------------
  * Request types (backend → worker)
@@ -32,18 +39,44 @@ typedef enum ZvecRequestType
     ZVEC_REQ_DELETE            = 5,
     ZVEC_REQ_OPTIMIZE          = 6,
     /*
-     * ZVEC_REQ_SCAN — full-table scan via the worker (which holds the
-     * write lock).  Results are written to a tmpfile whose path is
-     * encoded in the request payload; backend reads and deletes it.
+     * ZVEC_REQ_SCAN — full-table scan via the worker.
      *
      * Request payload: [col_name\0][max_rows: int32][dimension: int32]
-     *                  [tmpfile_path\0]
-     * Tmpfile layout:  [nrows: int32]
-     *                  [pks: nrows × char[256]]
-     *                  [vecs: nrows × dimension × float32]
+     *                  [n_scalar_fields: int32][field_name\0]...
+     *
+     * Response payload (via resp_mq):
+     *   [nrows: int32][n_scalar: int32]
+     *   [pks: nrows × char[256]]
+     *   [vecs: nrows × dimension × float32]
+     *   [scalar_data: (has_val:uint8 [string\0])... ]
      */
     ZVEC_REQ_SCAN              = 7,
 } ZvecRequestType;
+
+/* ----------------------------------------------------------------
+ * Wire-format message headers (sent through shm_mq)
+ * ---------------------------------------------------------------- */
+
+/* Request header: backend → worker via req_mq.
+ * Followed by data_len bytes of payload (same pack/unpack format). */
+typedef struct ZvecMsgHeader
+{
+    ZvecRequestType  type;
+    Oid              database_id;
+    int32            data_len;       /* bytes following this header */
+} ZvecMsgHeader;
+
+/* Response header: worker → backend via resp_mq.
+ * Followed by data_len bytes:
+ *   - On error:        null-terminated error string
+ *   - On SCAN success: binary scan payload
+ *   - On other success: empty (data_len == 0)
+ */
+typedef struct ZvecRespHeader
+{
+    bool    success;
+    int32   data_len;
+} ZvecRespHeader;
 
 /* ----------------------------------------------------------------
  * Collection registry entry (lives in shared memory)
@@ -61,35 +94,24 @@ typedef struct ZvecCollectionEntry
 } ZvecCollectionEntry;
 
 /* ----------------------------------------------------------------
- * Request struct: one backend posts this; worker reads it
+ * Session directory entry (one per connected backend)
+ *
+ * Each backend that needs IPC creates a DSM segment with a pair
+ * of shm_mq queues and registers here so the worker can discover it.
  * ---------------------------------------------------------------- */
-typedef struct ZvecRequest
+typedef struct ZvecSessionSlot
 {
-    ZvecRequestType type;
-    Oid             database_id;
-    pid_t           sender_pid;                     /* backend to notify via SetLatch */
-    int             data_len;
-    char            data[ZVEC_MAX_REQUEST_DATA];    /* serialised payload */
-} ZvecRequest;
-
-/* ----------------------------------------------------------------
- * Response struct: worker writes this; backend reads it
- * ---------------------------------------------------------------- */
-typedef struct ZvecResponse
-{
-    bool    success;
-    char    error_msg[ZVEC_MAX_RESPONSE_DATA];
-} ZvecResponse;
+    bool        in_use;
+    pid_t       backend_pid;
+    dsm_handle  handle;         /* DSM segment: req_mq + resp_mq */
+} ZvecSessionSlot;
 
 /* ----------------------------------------------------------------
  * Global shared state
- *
- * MVP: single-slot request/response (serialised, one at a time).
- * Phase 2 will replace with a proper per-backend shm_mq pair.
  * ---------------------------------------------------------------- */
 typedef struct PgZvecSharedState
 {
-    LWLock             *lock;           /* pointer into named LWLock tranche  */
+    LWLock             *lock;           /* protects collections[] and sessions[] */
 
     /* Worker lifecycle */
     pid_t               worker_pid;
@@ -99,11 +121,9 @@ typedef struct PgZvecSharedState
     int                 num_collections;
     ZvecCollectionEntry collections[ZVEC_MAX_COLLECTIONS];
 
-    /* Request / response slot */
-    bool                request_pending;
-    bool                response_ready;
-    ZvecRequest         request;
-    ZvecResponse        response;
+    /* Per-backend session directory */
+    pg_atomic_uint32    session_version;   /* bumped on session add/remove */
+    ZvecSessionSlot     sessions[ZVEC_MAX_SESSIONS];
 } PgZvecSharedState;
 
 /* Pointer to the shared state; set once during shmem startup */
