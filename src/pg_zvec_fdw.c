@@ -267,7 +267,7 @@ send_worker_request(ZvecRequest *req, ZvecResponse *resp,
 
         rc = WaitLatch(MyLatch,
                        WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-                       100L,
+                       1L,
                        PG_WAIT_EXTENSION);
         ResetLatch(MyLatch);
 
@@ -288,7 +288,7 @@ send_worker_request(ZvecRequest *req, ZvecResponse *resp,
         }
         LWLockRelease(pg_zvec_state->lock);
 
-        waited += 100;
+        waited += 1;
     }
 
     snprintf(errbuf, errbuf_len, "timed out waiting for pg_zvec worker");

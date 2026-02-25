@@ -691,7 +691,7 @@ pg_zvec_worker_main(Datum main_arg)
 
         rc = WaitLatch(MyLatch,
                        WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-                       1000L,
+                       10L,
                        PG_WAIT_EXTENSION);
         ResetLatch(MyLatch);
 
