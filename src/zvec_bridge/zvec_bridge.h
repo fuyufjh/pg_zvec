@@ -13,6 +13,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +33,8 @@ typedef struct ZvecCollectionHandle ZvecCollectionHandle;
  * dimension:  vector dimension
  * vec_type:   "vector_fp32" | "vector_fp16"
  * params_json: optional extra parameters as JSON string (may be NULL)
+ * n_scalar_fields:    number of extra scalar fields (0 = none)
+ * scalar_field_names: array of n_scalar_fields field name strings
  *
  * Returns NULL on failure; sets errbuf.
  */
@@ -41,6 +44,8 @@ ZvecCollectionHandle *zvec_collection_create(const char *data_dir,
                                               int         dimension,
                                               const char *vec_type,
                                               const char *params_json,
+                                              int         n_scalar_fields,
+                                              const char **scalar_field_names,
                                               char       *errbuf,
                                               int         errbuf_len);
 
@@ -69,15 +74,21 @@ bool zvec_collection_destroy(ZvecCollectionHandle *h,
  * ---------------------------------------------------------------- */
 
 /*
- * Insert or upsert a dense FP32 vector.
- * pk:       string primary key
- * vec:      pointer to float32 array
- * vec_len:  number of elements (must match collection dimension)
+ * Insert or upsert a dense FP32 vector, optionally with scalar fields.
+ * pk:              string primary key
+ * vec:             pointer to float32 array
+ * vec_len:         number of elements (must match collection dimension)
+ * n_scalars:       number of scalar key/value pairs (0 = none)
+ * scalar_names:    array of n_scalars field name strings
+ * scalar_values:   array of n_scalars value strings (NULL entry = null value)
  */
 bool zvec_collection_upsert(ZvecCollectionHandle *h,
                              const char  *pk,
                              const float *vec,
                              int          vec_len,
+                             int          n_scalars,
+                             const char **scalar_names,
+                             const char **scalar_values,
                              char        *errbuf,
                              int          errbuf_len);
 
@@ -142,6 +153,25 @@ int zvec_collection_scan_all(ZvecCollectionHandle *h,
                               float                *out_vecs,
                               char                 *errbuf,
                               int                   errbuf_len);
+
+/*
+ * Fetch scalar field values for the given primary keys and write them
+ * to the provided FILE* in a packed binary format.
+ *
+ * For each PK (in pks order), for each field (in field_names order):
+ *   [uint8: 0=null, 1=has_value]
+ *   [if has_value: null-terminated C string]
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int zvec_collection_write_scalars(ZvecCollectionHandle *h,
+                                   FILE                *fp,
+                                   int                  n_pks,
+                                   const char         (*pks)[256],
+                                   int                  n_fields,
+                                   const char         **field_names,
+                                   char                *errbuf,
+                                   int                  errbuf_len);
 
 /* ----------------------------------------------------------------
  * Metadata

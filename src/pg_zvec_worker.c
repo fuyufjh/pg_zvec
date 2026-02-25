@@ -143,6 +143,7 @@ process_request(void)
          * CREATE_COLLECTION
          * Payload: [name\0][data_dir\0][index_type\0][metric\0]
          *          [dimension: int32][vec_type\0][params_json\0]
+         *          [n_scalar_fields: int32][field_name\0]...
          * -------------------------------------------------------- */
         case ZVEC_REQ_CREATE_COLLECTION:
         {
@@ -155,6 +156,10 @@ process_request(void)
             char params_json[ZVEC_MAX_PARAMS_LEN];
             char errbuf[256];
             int  pos = 0;
+            int  n_scalar_fields = 0;
+            char scalar_names_buf[ZVEC_MAX_SCALAR_FIELDS][64];
+            const char *scalar_names_ptrs[ZVEC_MAX_SCALAR_FIELDS];
+            int  si;
             ZvecCollectionHandle *h;
             WorkerCollection     *wc;
             ZvecCollectionEntry  *entry;
@@ -180,6 +185,22 @@ process_request(void)
                                   params_json, sizeof(params_json));
             if (pos < 0) goto unpack_error;
 
+            /* Unpack scalar field names (may be absent in old-format requests) */
+            if (pos < req.data_len)
+            {
+                pos = zvec_unpack_int(req.data, pos, req.data_len, &n_scalar_fields);
+                if (pos < 0) n_scalar_fields = 0;
+                if (n_scalar_fields > ZVEC_MAX_SCALAR_FIELDS)
+                    n_scalar_fields = ZVEC_MAX_SCALAR_FIELDS;
+                for (si = 0; si < n_scalar_fields; si++)
+                {
+                    pos = zvec_unpack_str(req.data, pos, req.data_len,
+                                          scalar_names_buf[si], sizeof(scalar_names_buf[si]));
+                    if (pos < 0) { n_scalar_fields = si; break; }
+                    scalar_names_ptrs[si] = scalar_names_buf[si];
+                }
+            }
+
             /* Check not already registered */
             LWLockAcquire(pg_zvec_state->lock, LW_SHARED);
             entry = shmem_find_entry(col_name, req.database_id);
@@ -195,6 +216,7 @@ process_request(void)
             /* Create collection on disk */
             h = zvec_collection_create(data_dir, index_type, metric,
                                        dimension, vec_type, params_json,
+                                       n_scalar_fields, scalar_names_ptrs,
                                        errbuf, sizeof(errbuf));
             if (!h)
             {
@@ -315,6 +337,7 @@ process_request(void)
         /* --------------------------------------------------------
          * INSERT (upsert)
          * Payload: [name\0][pk\0][vec_len: int32][float32 * vec_len]
+         *          [n_scalars: int32][field_name\0 is_null:int32 value\0]...
          * -------------------------------------------------------- */
         case ZVEC_REQ_INSERT:
         {
@@ -324,6 +347,12 @@ process_request(void)
             float *vec = NULL;
             char  errbuf[256];
             int   pos = 0;
+            int   n_scalars = 0;
+            char  scalar_names_buf[ZVEC_MAX_SCALAR_FIELDS][64];
+            char  scalar_values_buf[ZVEC_MAX_SCALAR_FIELDS][4096];
+            const char *scalar_names_ptrs[ZVEC_MAX_SCALAR_FIELDS];
+            const char *scalar_values_ptrs[ZVEC_MAX_SCALAR_FIELDS];
+            int   si;
             WorkerCollection *wc;
 
             pos = zvec_unpack_str(req.data, pos, req.data_len,
@@ -341,6 +370,39 @@ process_request(void)
                                      vec, vec_len);
             if (pos < 0) goto insert_unpack_error;
 
+            /* Unpack scalar field values */
+            if (pos < req.data_len)
+            {
+                pos = zvec_unpack_int(req.data, pos, req.data_len, &n_scalars);
+                if (pos < 0) n_scalars = 0;
+                if (n_scalars > ZVEC_MAX_SCALAR_FIELDS)
+                    n_scalars = ZVEC_MAX_SCALAR_FIELDS;
+                for (si = 0; si < n_scalars; si++)
+                {
+                    int is_null_int = 0;
+
+                    pos = zvec_unpack_str(req.data, pos, req.data_len,
+                                          scalar_names_buf[si], sizeof(scalar_names_buf[si]));
+                    if (pos < 0) { n_scalars = si; break; }
+                    scalar_names_ptrs[si] = scalar_names_buf[si];
+
+                    pos = zvec_unpack_int(req.data, pos, req.data_len, &is_null_int);
+                    if (pos < 0) { n_scalars = si; break; }
+
+                    if (is_null_int)
+                    {
+                        scalar_values_ptrs[si] = NULL;
+                    }
+                    else
+                    {
+                        pos = zvec_unpack_str(req.data, pos, req.data_len,
+                                              scalar_values_buf[si], sizeof(scalar_values_buf[si]));
+                        if (pos < 0) { n_scalars = si; break; }
+                        scalar_values_ptrs[si] = scalar_values_buf[si];
+                    }
+                }
+            }
+
             wc = worker_find_coll(col_name);
             if (!wc)
             {
@@ -351,6 +413,8 @@ process_request(void)
             }
 
             if (!zvec_collection_upsert(wc->handle, pk, vec, vec_len,
+                                         n_scalars, scalar_names_ptrs,
+                                         scalar_values_ptrs,
                                          errbuf, sizeof(errbuf)))
             {
                 snprintf(resp.error_msg, sizeof(resp.error_msg), "%s", errbuf);
@@ -450,7 +514,10 @@ process_request(void)
          * SCAN — full table scan; results written to a tmpfile.
          * Payload: [name\0][max_rows: int32][dimension: int32]
          *          [tmpfile_path\0]
-         * Tmpfile: [nrows: int32][pks: nrows×256][vecs: nrows×dim×float]
+         *          [n_scalar_fields: int32][field_name\0]...
+         * Tmpfile: [nrows: int32][n_scalar_fields: int32]
+         *          [pks: nrows×256][vecs: nrows×dim×float]
+         *          [scalar_data]  (if n_scalar_fields > 0)
          * -------------------------------------------------------- */
         case ZVEC_REQ_SCAN:
         {
@@ -460,6 +527,10 @@ process_request(void)
             char   tmpfile[ZVEC_MAX_PATH_LEN];
             char   errbuf[256];
             int    pos = 0;
+            int    n_scalar_fields = 0;
+            char   scalar_names_buf[ZVEC_MAX_SCALAR_FIELDS][64];
+            const char *scalar_names_ptrs[ZVEC_MAX_SCALAR_FIELDS];
+            int    si;
             WorkerCollection *wc;
             char  (*pks)[256];
             float *vecs;
@@ -477,6 +548,22 @@ process_request(void)
                                   tmpfile, sizeof(tmpfile));
             if (pos < 0) goto scan_unpack_error;
 
+            /* Unpack scalar field names (may be absent in old-format requests) */
+            if (pos < req.data_len)
+            {
+                pos = zvec_unpack_int(req.data, pos, req.data_len, &n_scalar_fields);
+                if (pos < 0) n_scalar_fields = 0;
+                if (n_scalar_fields > ZVEC_MAX_SCALAR_FIELDS)
+                    n_scalar_fields = ZVEC_MAX_SCALAR_FIELDS;
+                for (si = 0; si < n_scalar_fields; si++)
+                {
+                    pos = zvec_unpack_str(req.data, pos, req.data_len,
+                                          scalar_names_buf[si], sizeof(scalar_names_buf[si]));
+                    if (pos < 0) { n_scalar_fields = si; break; }
+                    scalar_names_ptrs[si] = scalar_names_buf[si];
+                }
+            }
+
             wc = worker_find_coll(col_name);
             if (!wc)
             {
@@ -492,7 +579,13 @@ process_request(void)
             {
                 /* Write empty result file */
                 fp = fopen(tmpfile, "wb");
-                if (fp) { int z = 0; fwrite(&z, sizeof(int), 1, fp); fclose(fp); }
+                if (fp)
+                {
+                    int z = 0;
+                    fwrite(&z, sizeof(int), 1, fp);   /* nrows = 0 */
+                    fwrite(&n_scalar_fields, sizeof(int), 1, fp);
+                    fclose(fp);
+                }
                 break;
             }
 
@@ -521,9 +614,19 @@ process_request(void)
                 pfree(vecs);
                 break;
             }
-            fwrite(&nrows,   sizeof(int),   1,                         fp);
-            fwrite(pks,      256,           nrows,                     fp);
-            fwrite(vecs,     sizeof(float), (size_t) nrows * dimension, fp);
+            fwrite(&nrows,          sizeof(int),   1,                         fp);
+            fwrite(&n_scalar_fields, sizeof(int),  1,                         fp);
+            fwrite(pks,             256,           nrows,                     fp);
+            fwrite(vecs,            sizeof(float), (size_t) nrows * dimension, fp);
+
+            /* Write scalar field values if any */
+            if (n_scalar_fields > 0 && nrows > 0)
+            {
+                zvec_collection_write_scalars(wc->handle, fp,
+                                               nrows, pks,
+                                               n_scalar_fields, scalar_names_ptrs,
+                                               errbuf, sizeof(errbuf));
+            }
             fclose(fp);
 
             pfree(pks);

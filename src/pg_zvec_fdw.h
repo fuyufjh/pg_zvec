@@ -36,6 +36,11 @@ PGDLLEXPORT Datum zvec_fdw_validator(PG_FUNCTION_ARGS);
 PGDLLEXPORT void pg_zvec_worker_main(Datum main_arg);
 
 /* ----------------------------------------------------------------
+ * Maximum number of scalar (non-pk, non-vector) columns tracked
+ * ---------------------------------------------------------------- */
+#define ZVEC_MAX_SCALAR_FIELDS  32
+
+/* ----------------------------------------------------------------
  * Per-scan execution state
  * ---------------------------------------------------------------- */
 typedef struct ZvecFdwScanState
@@ -55,6 +60,18 @@ typedef struct ZvecFdwScanState
     Oid         pk_typioparam;
     int32       pk_atttypmod;
     FmgrInfo    pk_finfo;        /* pg input function for pk type */
+
+    /* Scalar field support */
+    int         n_scalar_fields;                          /* count of scalar columns */
+    int         scalar_attno[ZVEC_MAX_SCALAR_FIELDS];     /* 1-based attno in tupdesc */
+    char       *scalar_names[ZVEC_MAX_SCALAR_FIELDS];     /* zvec field names (= PG col names) */
+    /* Per-row scalar values: flat array [nrows * n_scalar_fields].
+     * scalar_vals[row * n_scalar_fields + fld] is NULL for null, else palloc'd string. */
+    char      **scalar_vals;
+    /* For converting scalar string → Datum */
+    FmgrInfo    scalar_finfos[ZVEC_MAX_SCALAR_FIELDS];
+    Oid         scalar_typioparams[ZVEC_MAX_SCALAR_FIELDS];
+    int32       scalar_atttypmod[ZVEC_MAX_SCALAR_FIELDS];
 } ZvecFdwScanState;
 
 /* ----------------------------------------------------------------
@@ -73,6 +90,13 @@ typedef struct ZvecFdwModifyState
     AttrNumber  pk_junk_attno;          /* junk attno in planSlot (DELETE only) */
     Oid         pk_typoutput;           /* output function OID for pk type */
     bool        pk_typisvarlena;        /* is pk type varlena? */
+
+    /* Scalar column support for INSERT */
+    int         n_scalar_fields;
+    int         scalar_attno[ZVEC_MAX_SCALAR_FIELDS];      /* 1-based attno */
+    char       *scalar_names[ZVEC_MAX_SCALAR_FIELDS];      /* zvec field names */
+    Oid         scalar_typoutput[ZVEC_MAX_SCALAR_FIELDS];  /* output fn OID */
+    bool        scalar_typisvarlena[ZVEC_MAX_SCALAR_FIELDS];
 } ZvecFdwModifyState;
 
 #endif /* PG_ZVEC_FDW_H */

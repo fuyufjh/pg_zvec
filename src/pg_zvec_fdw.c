@@ -103,6 +103,27 @@ zvec_get_vec_type_for_column(Oid relid, AttrNumber attno)
 }
 
 /*
+ * is_supported_scalar_type — return true if the PG type OID is one of the
+ * scalar types we can store in zvec.
+ */
+static bool
+is_supported_scalar_type(Oid typid)
+{
+    switch (typid)
+    {
+        case TEXTOID:
+        case BOOLOID:
+        case INT4OID:
+        case INT8OID:
+        case FLOAT4OID:
+        case FLOAT8OID:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/*
  * zvec_table_options — extract zvec-specific OPTIONS from a ForeignTable.
  *
  * All output pointers are palloc'd strings or default values.
@@ -299,6 +320,8 @@ zvec_create_collection_for_table(Oid relid)
     Relation       rel;
     TupleDesc      tupdesc;
     int            i;
+    int            n_scalar_fields = 0;
+    char          *scalar_field_names[ZVEC_MAX_SCALAR_FIELDS];
 
     ft     = GetForeignTable(relid);
     server = GetForeignServer(ft->serverid);
@@ -351,6 +374,21 @@ zvec_create_collection_for_table(Oid relid)
             break;
         }
     }
+
+    /* Identify scalar columns: skip pk (attno 1) and float4[] columns */
+    for (i = 0; i < tupdesc->natts && n_scalar_fields < ZVEC_MAX_SCALAR_FIELDS; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+        if (attr->attisdropped)
+            continue;
+        if (i == 0)     /* pk column */
+            continue;
+        if (attr->atttypid == FLOAT4ARRAYOID)  /* vector columns */
+            continue;
+        if (is_supported_scalar_type(attr->atttypid))
+            scalar_field_names[n_scalar_fields++] = NameStr(attr->attname);
+    }
+
     RelationClose(rel);
 
     /* Collection name = relation name (schema-unqualified) */
@@ -378,6 +416,15 @@ zvec_create_collection_for_table(Oid relid)
     if (pos < 0) goto overflow;
     pos = zvec_pack_str(req.data, pos, sizeof(req.data), params_json);
     if (pos < 0) goto overflow;
+
+    /* Pack scalar field names */
+    pos = zvec_pack_int(req.data, pos, sizeof(req.data), n_scalar_fields);
+    if (pos < 0) goto overflow;
+    for (i = 0; i < n_scalar_fields; i++)
+    {
+        pos = zvec_pack_str(req.data, pos, sizeof(req.data), scalar_field_names[i]);
+        if (pos < 0) goto overflow;
+    }
     req.data_len = pos;
 
     if (!send_worker_request(&req, &resp, 10000, errbuf, sizeof(errbuf)))
@@ -695,6 +742,31 @@ zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
         return;
     }
 
+    /* Identify scalar columns and set up type input functions */
+    state->n_scalar_fields = 0;
+    for (i = 0; i < tupdesc->natts && state->n_scalar_fields < ZVEC_MAX_SCALAR_FIELDS; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+        int sf;
+        Oid typinput;
+
+        if (attr->attisdropped)
+            continue;
+        if (i == 0)  /* pk column */
+            continue;
+        if (attr->atttypid == FLOAT4ARRAYOID)  /* vector columns */
+            continue;
+        if (!is_supported_scalar_type(attr->atttypid))
+            continue;
+
+        sf = state->n_scalar_fields++;
+        state->scalar_attno[sf] = i + 1;   /* 1-based */
+        state->scalar_names[sf] = pstrdup(NameStr(attr->attname));
+        state->scalar_atttypmod[sf] = attr->atttypmod;
+        getTypeInputInfo(attr->atttypid, &typinput, &state->scalar_typioparams[sf]);
+        fmgr_info(typinput, &state->scalar_finfos[sf]);
+    }
+
     /* ----------------------------------------------------------------
      * Route the scan through the background worker.
      *
@@ -713,6 +785,7 @@ zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
         int          pos = 0;
         FILE        *fp;
         int          nrows = 0;
+        int          file_n_scalar = 0;
         char       (*pks)[256] = NULL;
         float       *vecs = NULL;
 
@@ -731,6 +804,15 @@ zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
         if (pos < 0) goto overflow;
         pos = zvec_pack_str(req.data, pos, sizeof(req.data), tmpfile);
         if (pos < 0) goto overflow;
+
+        /* Pack scalar field names for the worker to fetch */
+        pos = zvec_pack_int(req.data, pos, sizeof(req.data), state->n_scalar_fields);
+        if (pos < 0) goto overflow;
+        for (i = 0; i < state->n_scalar_fields; i++)
+        {
+            pos = zvec_pack_str(req.data, pos, sizeof(req.data), state->scalar_names[i]);
+            if (pos < 0) goto overflow;
+        }
         req.data_len = pos;
 
         if (!send_worker_request(&req, &resp, 30000, errbuf, sizeof(errbuf)))
@@ -747,7 +829,9 @@ zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
         fp = fopen(tmpfile, "rb");
         if (fp)
         {
-            if (fread(&nrows, sizeof(int), 1, fp) == 1 && nrows > 0)
+            if (fread(&nrows, sizeof(int), 1, fp) == 1 &&
+                fread(&file_n_scalar, sizeof(int), 1, fp) == 1 &&
+                nrows > 0)
             {
                 pks  = (char (*)[256]) palloc(nrows * 256);
                 vecs = (float *) palloc((Size)((int64) nrows * dimension
@@ -761,6 +845,30 @@ zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
                     pks   = NULL;
                     vecs  = NULL;
                     nrows = 0;
+                }
+                else if (file_n_scalar > 0 && nrows > 0)
+                {
+                    /* Read scalar values section */
+                    int total = nrows * file_n_scalar;
+                    int si;
+                    state->scalar_vals = (char **) palloc0(total * sizeof(char *));
+                    for (si = 0; si < total; si++)
+                    {
+                        uint8 has_val = 0;
+                        if (fread(&has_val, 1, 1, fp) != 1)
+                            break;
+                        if (has_val)
+                        {
+                            /* Read null-terminated string */
+                            char buf[4096];
+                            int ch, bi = 0;
+                            while ((ch = fgetc(fp)) != EOF && ch != '\0' && bi < (int)sizeof(buf) - 1)
+                                buf[bi++] = (char) ch;
+                            buf[bi] = '\0';
+                            state->scalar_vals[si] = pstrdup(buf);
+                        }
+                        /* else: scalar_vals[si] stays NULL */
+                    }
                 }
             }
             fclose(fp);
@@ -842,6 +950,27 @@ zvec_iterate_foreign_scan(ForeignScanState *node)
         slot->tts_isnull[state->vec_attno - 1] = false;
     }
 
+    /* Fill scalar columns from cached scalar_vals */
+    if (state->n_scalar_fields > 0 && state->scalar_vals)
+    {
+        for (i = 0; i < state->n_scalar_fields; i++)
+        {
+            int   attidx = state->scalar_attno[i] - 1;  /* 0-based */
+            char *val    = state->scalar_vals[state->cur * state->n_scalar_fields + i];
+
+            if (val != NULL)
+            {
+                Datum d = InputFunctionCall(&state->scalar_finfos[i],
+                                            val,
+                                            state->scalar_typioparams[i],
+                                            state->scalar_atttypmod[i]);
+                slot->tts_values[attidx] = d;
+                slot->tts_isnull[attidx] = false;
+            }
+            /* else: already set to NULL above */
+        }
+    }
+
     ExecStoreVirtualTuple(slot);
     state->cur++;
     return slot;
@@ -863,6 +992,21 @@ zvec_end_foreign_scan(ForeignScanState *node)
     {
         if (state->pks)  pfree(state->pks);
         if (state->vecs) pfree(state->vecs);
+        if (state->scalar_vals)
+        {
+            int total = state->nrows * state->n_scalar_fields;
+            int i;
+            for (i = 0; i < total; i++)
+                if (state->scalar_vals[i])
+                    pfree(state->scalar_vals[i]);
+            pfree(state->scalar_vals);
+        }
+        {
+            int i;
+            for (i = 0; i < state->n_scalar_fields; i++)
+                if (state->scalar_names[i])
+                    pfree(state->scalar_names[i]);
+        }
         pfree(state);
         node->fdw_state = NULL;
     }
@@ -971,6 +1115,30 @@ zvec_begin_foreign_modify(ModifyTableState *mtstate,
                  errmsg("pg_zvec: no float4[] vector column found in \"%s\"",
                         mstate->collection_name)));
 
+    /* Identify scalar columns (non-pk, non-vector, supported types) */
+    mstate->n_scalar_fields = 0;
+    for (i = 0; i < tupdesc->natts && mstate->n_scalar_fields < ZVEC_MAX_SCALAR_FIELDS; i++)
+    {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+        int sf;
+
+        if (attr->attisdropped)
+            continue;
+        if (i == 0)  /* pk column */
+            continue;
+        if (attr->atttypid == FLOAT4ARRAYOID)  /* vector columns */
+            continue;
+        if (!is_supported_scalar_type(attr->atttypid))
+            continue;
+
+        sf = mstate->n_scalar_fields++;
+        mstate->scalar_attno[sf] = i + 1;   /* 1-based */
+        mstate->scalar_names[sf] = pstrdup(NameStr(attr->attname));
+        getTypeOutputInfo(attr->atttypid,
+                          &mstate->scalar_typoutput[sf],
+                          &mstate->scalar_typisvarlena[sf]);
+    }
+
     /* For DELETE: locate the "zvec_pk" junk attribute in the subplan */
     if (mtstate->operation == CMD_DELETE)
     {
@@ -1044,7 +1212,10 @@ zvec_exec_foreign_insert(EState *estate,
                         mstate->dimension, vec_len)));
     vec = (float4 *) ARR_DATA_PTR(arr);
 
-    /* Build IPC payload: [name\0][pk\0][vec_len:int32][float32*vec_len] */
+    /* Build IPC payload:
+     * [name\0][pk\0][vec_len:int32][float32*vec_len]
+     * [n_scalars:int32][field_name\0 is_null:int32 value\0]...
+     */
     memset(&req, 0, sizeof(req));
     req.type        = ZVEC_REQ_INSERT;
     req.database_id = MyDatabaseId;
@@ -1057,6 +1228,35 @@ zvec_exec_foreign_insert(EState *estate,
     if (pos < 0) goto overflow;
     pos = zvec_pack_floats(req.data, pos, sizeof(req.data), vec, vec_len);
     if (pos < 0) goto overflow;
+
+    /* Pack scalar field values */
+    pos = zvec_pack_int(req.data, pos, sizeof(req.data), mstate->n_scalar_fields);
+    if (pos < 0) goto overflow;
+    {
+        int si;
+        for (si = 0; si < mstate->n_scalar_fields; si++)
+        {
+            Datum  sd;
+            bool   sn;
+            int    is_null_int;
+
+            pos = zvec_pack_str(req.data, pos, sizeof(req.data), mstate->scalar_names[si]);
+            if (pos < 0) goto overflow;
+
+            sd = slot_getattr(slot, mstate->scalar_attno[si], &sn);
+            is_null_int = sn ? 1 : 0;
+            pos = zvec_pack_int(req.data, pos, sizeof(req.data), is_null_int);
+            if (pos < 0) goto overflow;
+
+            if (!sn)
+            {
+                char *val_str = OidOutputFunctionCall(mstate->scalar_typoutput[si], sd);
+                pos = zvec_pack_str(req.data, pos, sizeof(req.data), val_str);
+                if (pos < 0) goto overflow;
+                pfree(val_str);
+            }
+        }
+    }
     req.data_len = pos;
 
     if (!send_worker_request(&req, &resp, 10000, errbuf, sizeof(errbuf)))

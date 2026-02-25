@@ -68,6 +68,8 @@ zvec_collection_create(const char *data_dir,
                        int         dimension,
                        const char *vec_type,
                        const char * /* params_json – TODO: parse */,
+                       int         n_scalar_fields,
+                       const char **scalar_field_names,
                        char       *errbuf,
                        int         errbuf_len)
 {
@@ -90,6 +92,14 @@ zvec_collection_create(const char *data_dir,
     auto pk_field = std::make_shared<zvec::FieldSchema>(
         "__pk__", zvec::DataType::STRING, /*nullable=*/false);
     schema.add_field(pk_field);
+
+    /* Add scalar fields (all stored as STRING in zvec) */
+    for (int i = 0; i < n_scalar_fields; ++i)
+    {
+        auto sf = std::make_shared<zvec::FieldSchema>(
+            scalar_field_names[i], zvec::DataType::STRING, /*nullable=*/true);
+        schema.add_field(sf);
+    }
 
     zvec::CollectionOptions opts;
     auto result = zvec::Collection::CreateAndOpen(data_dir, schema, opts);
@@ -162,6 +172,9 @@ zvec_collection_upsert(ZvecCollectionHandle *h,
                        const char  *pk,
                        const float *vec,
                        int          vec_len,
+                       int          n_scalars,
+                       const char **scalar_names,
+                       const char **scalar_values,
                        char        *errbuf,
                        int          errbuf_len)
 {
@@ -170,6 +183,15 @@ zvec_collection_upsert(ZvecCollectionHandle *h,
     doc.set(std::string("embedding"),
             std::vector<float>(vec, vec + vec_len));
     doc.set(std::string("__pk__"), std::string(pk));
+
+    /* Set scalar field values (all as strings) */
+    for (int i = 0; i < n_scalars; ++i)
+    {
+        if (scalar_values[i] != nullptr)
+            doc.set(std::string(scalar_names[i]),
+                    std::string(scalar_values[i]));
+        /* NULL values: do not set the field → zvec treats it as missing/null */
+    }
 
     std::vector<zvec::Doc> docs = {doc};
     auto result = h->col->Upsert(docs);
@@ -336,6 +358,61 @@ zvec_collection_scan_all(ZvecCollectionHandle *h,
 }
 
 int
+zvec_collection_write_scalars(ZvecCollectionHandle *h,
+                               FILE                *fp,
+                               int                  n_pks,
+                               const char         (*pks)[256],
+                               int                  n_fields,
+                               const char         **field_names,
+                               char                *errbuf,
+                               int                  errbuf_len)
+{
+    if (n_pks <= 0 || n_fields <= 0)
+        return 0;
+
+    /* Collect PKs into a vector */
+    std::vector<std::string> pk_list;
+    pk_list.reserve(n_pks);
+    for (int i = 0; i < n_pks; ++i)
+        pk_list.push_back(std::string(pks[i]));
+
+    /* Fetch full docs from the forward store */
+    auto fetch_result = h->col->Fetch(pk_list);
+    if (!fetch_result)
+    {
+        snprintf(errbuf, errbuf_len, "%s", fetch_result.error().message().c_str());
+        return -1;
+    }
+
+    const auto &doc_map = *fetch_result;
+
+    /* Write scalar values: for each row, for each field */
+    for (int i = 0; i < n_pks; ++i)
+    {
+        auto it = doc_map.find(pk_list[i]);
+        for (int f = 0; f < n_fields; ++f)
+        {
+            if (it != doc_map.end() && it->second)
+            {
+                auto val_opt = it->second->get<std::string>(field_names[f]);
+                if (val_opt.has_value())
+                {
+                    uint8_t has_val = 1;
+                    fwrite(&has_val, 1, 1, fp);
+                    const std::string &v = val_opt.value();
+                    fwrite(v.c_str(), 1, v.size() + 1, fp); /* include \0 */
+                    continue;
+                }
+            }
+            /* NULL / missing field */
+            uint8_t has_val = 0;
+            fwrite(&has_val, 1, 1, fp);
+        }
+    }
+    return 0;
+}
+
+int
 zvec_collection_doc_count(ZvecCollectionHandle *h)
 {
     auto result = h->col->Stats();
@@ -366,7 +443,8 @@ extern "C" {
 
 ZvecCollectionHandle *
 zvec_collection_create(const char *, const char *, const char *, int,
-                       const char *, const char *, char *errbuf, int errbuf_len)
+                       const char *, const char *, int, const char **,
+                       char *errbuf, int errbuf_len)
 { stub_err(errbuf, errbuf_len, "zvec_collection_create"); return nullptr; }
 
 ZvecCollectionHandle *
@@ -382,7 +460,8 @@ bool zvec_collection_destroy(ZvecCollectionHandle *, char *errbuf, int errbuf_le
 { stub_err(errbuf, errbuf_len, "zvec_collection_destroy"); return false; }
 
 bool zvec_collection_upsert(ZvecCollectionHandle *, const char *, const float *,
-                             int, char *errbuf, int errbuf_len)
+                             int, int, const char **, const char **,
+                             char *errbuf, int errbuf_len)
 { stub_err(errbuf, errbuf_len, "zvec_collection_upsert"); return false; }
 
 bool zvec_collection_delete(ZvecCollectionHandle *, const char *,
@@ -401,6 +480,11 @@ int zvec_collection_scan_all(ZvecCollectionHandle *, int, int,
                               char (*)[256], float *,
                               char * /*errbuf*/, int /*errbuf_len*/)
 { return 0; /* no rows — zvec library not compiled in */ }
+
+int zvec_collection_write_scalars(ZvecCollectionHandle *, FILE *, int,
+                                   const char (*)[256], int, const char **,
+                                   char * /*errbuf*/, int /*errbuf_len*/)
+{ return 0; /* no-op — zvec library not compiled in */ }
 
 int zvec_collection_doc_count(ZvecCollectionHandle *) { return -1; }
 
