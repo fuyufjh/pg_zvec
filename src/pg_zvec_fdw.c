@@ -12,6 +12,7 @@
 #include "pg_zvec_shmem.h"
 #include "zvec_bridge/zvec_bridge.h"
 
+#include <math.h>
 #include <stdio.h>
 
 #include "access/htup_details.h"
@@ -775,21 +776,231 @@ zvec_get_foreign_rel_size(PlannerInfo *root,
     baserel->rows = 1000;
 }
 
+/* Helper: check if an Expr is one of our distance operators */
+static bool
+is_distance_operator(Oid opno, Oid *out_distance_metric)
+{
+    char *oprname;
+    
+    oprname = get_opname(opno);
+    if (!oprname)
+        return false;
+    
+    if (strcmp(oprname, "<->") == 0)
+    {
+        *out_distance_metric = 1;  /* L2 */
+        return true;
+    }
+    if (strcmp(oprname, "<=>") == 0)
+    {
+        *out_distance_metric = 2;  /* cosine */
+        return true;
+    }
+    if (strcmp(oprname, "<#>") == 0)
+    {
+        *out_distance_metric = 3;  /* IP */
+        return true;
+    }
+    return false;
+}
+
+/* Helper: extract query vector from a Const or Param node */
+static float *
+extract_query_vector(Node *expr, int *out_len, PlannerInfo *root)
+{
+    ArrayType *arr;
+    float     *vec_data;
+    int        vec_len;
+    float     *result;
+    Const     *c;
+    
+    /* For now, only handle Const nodes (literal arrays) */
+    if (!IsA(expr, Const))
+        return NULL;
+    
+    c = (Const *) expr;
+    if (c->constisnull)
+        return NULL;
+    
+    arr = DatumGetArrayTypeP(c->constvalue);
+    if (ARR_NDIM(arr) != 1 || ARR_ELEMTYPE(arr) != FLOAT4OID)
+        return NULL;
+    
+    vec_len  = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+    vec_data = (float *) ARR_DATA_PTR(arr);
+    
+    /* Copy to palloc'd memory */
+    result = (float *) palloc(vec_len * sizeof(float));
+    memcpy(result, vec_data, vec_len * sizeof(float));
+    
+    *out_len = vec_len;
+    return result;
+}
+
 static void
 zvec_get_foreign_paths(PlannerInfo *root,
                         RelOptInfo  *baserel,
                         Oid          foreigntableid)
 {
-    add_path(baserel,
-             (Path *) create_foreignscan_path(root, baserel,
-                                               NULL,            /* default pathtarget */
-                                               baserel->rows,
-                                               1,               /* startup cost */
-                                               baserel->rows * 1,
-                                               NIL,             /* no pathkeys */
-                                               baserel->lateral_relids,
-                                               NULL,
-                                               NIL));
+    ForeignTable  *ft;
+    ForeignServer *server;
+    char          *data_dir, *metric, *index_type, *params_json;
+    int            dimension;
+    bool           is_ann = false;
+    float         *query_vec = NULL;
+    int            query_vec_len = 0;
+    int            vec_attno = -1;
+    double         limit_tuples = 0;
+    List          *ann_fdw_private = NIL;
+    Node          *left, *right;
+    Node          *query_arg;
+    
+    ft     = GetForeignTable(foreigntableid);
+    server = GetForeignServer(ft->serverid);
+    zvec_table_options(ft, server, &data_dir, &dimension,
+                       &metric, &index_type, &params_json);
+    
+    /* Locate vector column (first float4[]) */
+    {
+        Relation rel = RelationIdGetRelation(foreigntableid);
+        TupleDesc tupdesc = RelationGetDescr(rel);
+        for (int i = 0; i < tupdesc->natts; i++)
+        {
+            Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+            if (!attr->attisdropped && attr->atttypid == FLOAT4ARRAYOID)
+            {
+                vec_attno = i + 1;  /* 1-based */
+                break;
+            }
+        }
+        RelationClose(rel);
+    }
+    
+    /* Check for ANN pattern: ORDER BY distance_op(vec_col, query_const) LIMIT k */
+    if (vec_attno > 0 && root->query_pathkeys != NIL && root->limit_tuples > 0)
+    {
+        PathKey *pk = (PathKey *) linitial(root->query_pathkeys);
+        EquivalenceMember *em;
+        ListCell *lc2;
+        
+        /* Iterate over equivalence members to find distance operator expression */
+        foreach(lc2, pk->pk_eclass->ec_members)
+        {
+            em = (EquivalenceMember *) lfirst(lc2);
+            
+            if (em->em_is_child)
+                continue;
+            
+            /* Check if expr is OpExpr with our distance operator */
+            if (IsA(em->em_expr, OpExpr))
+            {
+                OpExpr *opexpr = (OpExpr *) em->em_expr;
+                Oid distance_metric = 0;
+                
+                if (!is_distance_operator(opexpr->opno, &distance_metric))
+                    continue;
+                
+                /* Must have 2 args: (vec_col, query) or (query, vec_col) */
+                if (list_length(opexpr->args) != 2)
+                    continue;
+                
+                left  = (Node *) linitial(opexpr->args);
+                right = (Node *) lsecond(opexpr->args);
+                query_arg = NULL;
+                
+                /* Determine which arg is the column and which is the query */
+                if (IsA(left, Var))
+                {
+                    Var *v = (Var *) left;
+                    if (v->varno == baserel->relid && v->varattno == vec_attno)
+                    {
+                        query_arg = right;
+                    }
+                }
+                if (!query_arg && IsA(right, Var))
+                {
+                    Var *v = (Var *) right;
+                    if (v->varno == baserel->relid && v->varattno == vec_attno)
+                    {
+                        query_arg = left;
+                    }
+                }
+                
+                if (!query_arg)
+                    continue;
+                
+                /* Extract query vector (currently only supports Const) */
+                query_vec = extract_query_vector(query_arg, &query_vec_len, root);
+                if (!query_vec)
+                    continue;
+                
+                /* Validate dimension */
+                if (query_vec_len != dimension)
+                {
+                    pfree(query_vec);
+                    ereport(WARNING,
+                            (errmsg("pg_zvec: query vector dimension %d does not match table dimension %d",
+                                    query_vec_len, dimension)));
+                    continue;
+                }
+                
+                /* We have a valid ANN pattern! */
+                is_ann = true;
+                limit_tuples = root->limit_tuples;
+                
+                /* Store ANN parameters in fdw_private as a List */
+                ann_fdw_private = lappend(ann_fdw_private, makeInteger(1));  /* marker: is_ann */
+                ann_fdw_private = lappend(ann_fdw_private, makeInteger(query_vec_len));
+                ann_fdw_private = lappend(ann_fdw_private, makeInteger((int)limit_tuples));
+                ann_fdw_private = lappend(ann_fdw_private, makeInteger(distance_metric));
+                
+                /* Serialize query vector as Const nodes */
+                for (int i = 0; i < query_vec_len; i++)
+                    ann_fdw_private = lappend(ann_fdw_private,
+                                              makeConst(FLOAT4OID, -1, InvalidOid, sizeof(float4),
+                                                        Float4GetDatum(query_vec[i]),
+                                                        false, true));
+                
+                pfree(query_vec);  /* will be reconstructed in BeginForeignScan */
+                break;
+            }
+        }
+    }
+    
+    if (is_ann)
+    {
+        /* ANN path: low cost, returns LIMIT rows */
+        Cost startup_cost = 10;
+        Cost total_cost   = startup_cost + limit_tuples * 0.1;
+        
+        add_path(baserel,
+                 (Path *) create_foreignscan_path(root, baserel,
+                                                   NULL,  /* default pathtarget */
+                                                   limit_tuples,
+                                                   startup_cost,
+                                                   total_cost,
+                                                   root->query_pathkeys,  /* preserve ORDER BY */
+                                                   baserel->lateral_relids,
+                                                   NULL,
+                                                   ann_fdw_private));
+    }
+    else
+    {
+        /* Sequential scan path (fallback) */
+        Cost startup_cost = 1;
+        Cost total_cost   = startup_cost + baserel->rows * 1;
+        
+        add_path(baserel,
+                 (Path *) create_foreignscan_path(root, baserel,
+                                                   NULL,
+                                                   baserel->rows,
+                                                   startup_cost,
+                                                   total_cost,
+                                                   NIL,  /* no pathkeys */
+                                                   baserel->lateral_relids,
+                                                   NULL,
+                                                   NIL));
+    }
 }
 
 static ForeignScan *
@@ -819,6 +1030,7 @@ zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
     TupleDesc            tupdesc = RelationGetDescr(rel);
     ForeignTable        *ft;
     ForeignServer       *server;
+    ForeignScan         *fsplan  = (ForeignScan *) node->ss.ps.plan;
     char                *data_dir, *metric, *index_type, *params_json;
     int                  dimension;
     ZvecFdwScanState    *state;
@@ -898,17 +1110,110 @@ zvec_begin_foreign_scan(ForeignScanState *node, int eflags)
         fmgr_info(typinput, &state->scalar_finfos[sf]);
     }
 
-    /* ----------------------------------------------------------------
-     * Route the scan through the background worker via shm_mq.
-     *
-     * zvec uses an exclusive file lock for write handles.  The worker
-     * owns the write handle, so we cannot open a read-only handle
-     * concurrently.  We send ZVEC_REQ_SCAN; the worker scans and
-     * returns the results inline in the resp_mq payload.
-     * ---------------------------------------------------------------- */
     strlcpy(col_name, RelationGetRelationName(rel), sizeof(col_name));
 
+    /* ----------------------------------------------------------------
+     * Decode fdw_private to determine if this is an ANN scan
+     * ---------------------------------------------------------------- */
+    state->is_ann_scan = false;
+    if (fsplan->fdw_private != NIL)
     {
+        List *priv = fsplan->fdw_private;
+        if (list_length(priv) >= 4)
+        {
+            int marker = intVal(linitial(priv));
+            if (marker == 1)  /* ANN marker */
+            {
+                int qv_len = intVal(lsecond(priv));
+                int topk   = intVal(lthird(priv));
+                ListCell *lc;
+                int idx;
+                
+                if (qv_len == dimension && list_length(priv) >= 4 + qv_len)
+                {
+                    state->is_ann_scan    = true;
+                    state->query_vec_len  = qv_len;
+                    state->topk           = topk;
+                    state->query_vec      = (float *) palloc(qv_len * sizeof(float));
+                    state->filter_expr    = NULL;  /* TODO: filter pushdown in Phase 4 */
+                    
+                    /* Extract query vector from remaining Const nodes */
+                    idx = 0;
+                    for_each_from(lc, priv, 4)
+                    {
+                        Const *c;
+                        if (idx >= qv_len)
+                            break;
+                        c = (Const *) lfirst(lc);
+                        state->query_vec[idx++] = DatumGetFloat4(c->constvalue);
+                    }
+                }
+            }
+        }
+    }
+
+    /* ----------------------------------------------------------------
+     * Route: ANN search (direct backend call) vs sequential scan (IPC)
+     * ---------------------------------------------------------------- */
+    if (state->is_ann_scan)
+    {
+        /* ANN search: backend directly opens read-only zvec handle and searches */
+        char col_path[ZVEC_MAX_PATH_LEN];
+        snprintf(col_path, sizeof(col_path), "%s/%s", data_dir, col_name);
+        
+        #ifdef USE_ZVEC
+        ZvecCollectionHandle *h = zvec_collection_open(col_path, true, errbuf, sizeof(errbuf));
+        if (!h)
+        {
+            ereport(WARNING,
+                    (errmsg("pg_zvec: failed to open collection \"%s\" for ANN search: %s",
+                            col_name, errbuf)));
+            state->done = true;
+            node->fdw_state = state;
+            return;
+        }
+        
+        /* Perform ANN search */
+        ZvecSearchResult *results = (ZvecSearchResult *) palloc(state->topk * sizeof(ZvecSearchResult));
+        int nresults = zvec_collection_search(h, state->query_vec, state->query_vec_len,
+                                              state->topk, state->filter_expr,
+                                              results, errbuf, sizeof(errbuf));
+        zvec_collection_close(h);
+        
+        if (nresults < 0)
+        {
+            ereport(WARNING,
+                    (errmsg("pg_zvec: ANN search failed: %s", errbuf)));
+            pfree(results);
+            state->done = true;
+            node->fdw_state = state;
+            return;
+        }
+        
+        /* Convert search results to scan buffers */
+        state->nrows = nresults;
+        state->pks   = (char (*)[256]) palloc(nresults * 256);
+        state->vecs  = NULL;  /* ANN results don't include vectors by default */
+        
+        for (i = 0; i < nresults; i++)
+            strlcpy(state->pks[i], results[i].pk, 256);
+        
+        pfree(results);
+        
+        /* TODO: fetch scalar fields for returned PKs */
+        state->scalar_vals = NULL;
+        
+        #else  /* !USE_ZVEC */
+        ereport(WARNING,
+                (errmsg("pg_zvec: ANN search requested but zvec library not available")));
+        state->done = true;
+        node->fdw_state = state;
+        return;
+        #endif
+    }
+    else
+    {
+        /* Sequential scan via worker IPC (existing implementation) */
         char           buf[4096];
         int            bufsz = sizeof(buf);
         ZvecRespHeader resp_hdr;
@@ -1053,7 +1358,7 @@ zvec_iterate_foreign_scan(ForeignScanState *node)
     }
 
     /* Fill vector column (first float4[]) */
-    if (state->vec_attno >= 1 && state->vec_attno <= natts)
+    if (state->vec_attno >= 1 && state->vec_attno <= natts && state->vecs != NULL)
     {
         float     *vec   = state->vecs + (int64) state->cur * state->dimension;
         int        dim   = state->dimension;
@@ -1072,6 +1377,7 @@ zvec_iterate_foreign_scan(ForeignScanState *node)
         slot->tts_values[state->vec_attno - 1] = PointerGetDatum(arr);
         slot->tts_isnull[state->vec_attno - 1] = false;
     }
+    /* else: vector column stays NULL for ANN results that don't include vectors */
 
     /* Fill scalar columns from cached scalar_vals */
     if (state->n_scalar_fields > 0 && state->scalar_vals)
@@ -1115,6 +1421,7 @@ zvec_end_foreign_scan(ForeignScanState *node)
     {
         if (state->pks)  pfree(state->pks);
         if (state->vecs) pfree(state->vecs);
+        if (state->query_vec) pfree(state->query_vec);
         if (state->scalar_vals)
         {
             int total = state->nrows * state->n_scalar_fields;
@@ -1132,6 +1439,25 @@ zvec_end_foreign_scan(ForeignScanState *node)
         }
         pfree(state);
         node->fdw_state = NULL;
+    }
+}
+
+static void
+zvec_explain_foreign_scan(ForeignScanState *node, ExplainState *es)
+{
+    ZvecFdwScanState *state = (ZvecFdwScanState *) node->fdw_state;
+    
+    if (state && state->is_ann_scan)
+    {
+        ExplainPropertyText("Zvec Scan Type", "ANN Search", es);
+        ExplainPropertyInteger("ANN TopK", NULL, state->topk, es);
+        ExplainPropertyInteger("Query Dimension", NULL, state->query_vec_len, es);
+        if (state->filter_expr)
+            ExplainPropertyText("Zvec Filter", state->filter_expr, es);
+    }
+    else
+    {
+        ExplainPropertyText("Zvec Scan Type", "Sequential", es);
     }
 }
 
@@ -1476,6 +1802,7 @@ zvec_fdw_handler(PG_FUNCTION_ARGS)
     routine->IterateForeignScan = zvec_iterate_foreign_scan;
     routine->ReScanForeignScan  = zvec_rescan_foreign_scan;
     routine->EndForeignScan     = zvec_end_foreign_scan;
+    routine->ExplainForeignScan = zvec_explain_foreign_scan;
 
     /* Modify (Phase 3) */
     routine->AddForeignUpdateTargets = zvec_add_foreign_update_targets;
@@ -1628,6 +1955,133 @@ register_background_worker(void)
 
     worker.bgw_notify_pid = 0;
     RegisterBackgroundWorker(&worker);
+}
+
+/* ----------------------------------------------------------------
+ * Distance operator functions (Phase 2)
+ * ---------------------------------------------------------------- */
+
+static float
+compute_l2_distance(const float *a, const float *b, int dim)
+{
+    float sum = 0.0f;
+    for (int i = 0; i < dim; i++)
+    {
+        float diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return sqrtf(sum);
+}
+
+static float
+compute_cosine_distance(const float *a, const float *b, int dim)
+{
+    float dot = 0.0f, norm_a = 0.0f, norm_b = 0.0f;
+    float cos_sim;
+    int i;
+    for (i = 0; i < dim; i++)
+    {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    if (norm_a < 1e-10f || norm_b < 1e-10f)
+        return 1.0f;  /* degenerate case */
+    cos_sim = dot / (sqrtf(norm_a) * sqrtf(norm_b));
+    return 1.0f - cos_sim;
+}
+
+static float
+compute_ip_distance(const float *a, const float *b, int dim)
+{
+    float dot = 0.0f;
+    for (int i = 0; i < dim; i++)
+        dot += a[i] * b[i];
+    return -dot;
+}
+
+PG_FUNCTION_INFO_V1(zvec_l2_distance);
+Datum
+zvec_l2_distance(PG_FUNCTION_ARGS)
+{
+    ArrayType *a_arr = PG_GETARG_ARRAYTYPE_P(0);
+    ArrayType *b_arr = PG_GETARG_ARRAYTYPE_P(1);
+    int dim_a, dim_b;
+    float *a_data, *b_data;
+
+    if (ARR_NDIM(a_arr) != 1 || ARR_NDIM(b_arr) != 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                 errmsg("arrays must be 1-dimensional")));
+
+    dim_a = ArrayGetNItems(ARR_NDIM(a_arr), ARR_DIMS(a_arr));
+    dim_b = ArrayGetNItems(ARR_NDIM(b_arr), ARR_DIMS(b_arr));
+
+    if (dim_a != dim_b)
+        ereport(ERROR,
+                (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                 errmsg("array dimensions must match")));
+
+    a_data = (float *) ARR_DATA_PTR(a_arr);
+    b_data = (float *) ARR_DATA_PTR(b_arr);
+
+    PG_RETURN_FLOAT4(compute_l2_distance(a_data, b_data, dim_a));
+}
+
+PG_FUNCTION_INFO_V1(zvec_cosine_distance);
+Datum
+zvec_cosine_distance(PG_FUNCTION_ARGS)
+{
+    ArrayType *a_arr = PG_GETARG_ARRAYTYPE_P(0);
+    ArrayType *b_arr = PG_GETARG_ARRAYTYPE_P(1);
+    int dim_a, dim_b;
+    float *a_data, *b_data;
+
+    if (ARR_NDIM(a_arr) != 1 || ARR_NDIM(b_arr) != 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                 errmsg("arrays must be 1-dimensional")));
+
+    dim_a = ArrayGetNItems(ARR_NDIM(a_arr), ARR_DIMS(a_arr));
+    dim_b = ArrayGetNItems(ARR_NDIM(b_arr), ARR_DIMS(b_arr));
+
+    if (dim_a != dim_b)
+        ereport(ERROR,
+                (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                 errmsg("array dimensions must match")));
+
+    a_data = (float *) ARR_DATA_PTR(a_arr);
+    b_data = (float *) ARR_DATA_PTR(b_arr);
+
+    PG_RETURN_FLOAT4(compute_cosine_distance(a_data, b_data, dim_a));
+}
+
+PG_FUNCTION_INFO_V1(zvec_ip_distance);
+Datum
+zvec_ip_distance(PG_FUNCTION_ARGS)
+{
+    ArrayType *a_arr = PG_GETARG_ARRAYTYPE_P(0);
+    ArrayType *b_arr = PG_GETARG_ARRAYTYPE_P(1);
+    int dim_a, dim_b;
+    float *a_data, *b_data;
+
+    if (ARR_NDIM(a_arr) != 1 || ARR_NDIM(b_arr) != 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                 errmsg("arrays must be 1-dimensional")));
+
+    dim_a = ArrayGetNItems(ARR_NDIM(a_arr), ARR_DIMS(a_arr));
+    dim_b = ArrayGetNItems(ARR_NDIM(b_arr), ARR_DIMS(b_arr));
+
+    if (dim_a != dim_b)
+        ereport(ERROR,
+                (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                 errmsg("array dimensions must match")));
+
+    a_data = (float *) ARR_DATA_PTR(a_arr);
+    b_data = (float *) ARR_DATA_PTR(b_arr);
+
+    PG_RETURN_FLOAT4(compute_ip_distance(a_data, b_data, dim_a));
 }
 
 /* ----------------------------------------------------------------

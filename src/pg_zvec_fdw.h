@@ -31,6 +31,13 @@ PGDLLEXPORT Datum zvec_fdw_handler(PG_FUNCTION_ARGS);
 PGDLLEXPORT Datum zvec_fdw_validator(PG_FUNCTION_ARGS);
 
 /* ----------------------------------------------------------------
+ * Distance operator functions (Phase 2)
+ * ---------------------------------------------------------------- */
+PGDLLEXPORT Datum zvec_l2_distance(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum zvec_cosine_distance(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum zvec_ip_distance(PG_FUNCTION_ARGS);
+
+/* ----------------------------------------------------------------
  * Background worker entry point
  * ---------------------------------------------------------------- */
 PGDLLEXPORT void pg_zvec_worker_main(Datum main_arg);
@@ -72,6 +79,13 @@ typedef struct ZvecFdwScanState
     FmgrInfo    scalar_finfos[ZVEC_MAX_SCALAR_FIELDS];
     Oid         scalar_typioparams[ZVEC_MAX_SCALAR_FIELDS];
     int32       scalar_atttypmod[ZVEC_MAX_SCALAR_FIELDS];
+
+    /* ANN query state (Phase 2) */
+    bool        is_ann_scan;                              /* true if this is an ANN path */
+    float      *query_vec;                                /* query vector (palloc'd) */
+    int         query_vec_len;                            /* dimension */
+    int         topk;                                     /* LIMIT k */
+    char       *filter_expr;                              /* scalar filter expression (optional) */
 } ZvecFdwScanState;
 
 /* ----------------------------------------------------------------
